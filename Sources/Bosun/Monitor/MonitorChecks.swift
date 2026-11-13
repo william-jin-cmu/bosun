@@ -379,7 +379,11 @@ enum MonitorChecks {
             var snapshot = MonitorSnapshot()
             var prefs = MonitorPrefs()
             guard StatusComposer.pieces(prefs: prefs, snapshot: snapshot) == [.icon] else { return "default is not the plain icon" }
-            guard StatusRenderer.image([.icon]) === WheelGlyph.menuBarImage else { return "default image is not the wheel glyph" }
+            guard StatusRenderer.image([.icon]) === MainActor.assumeIsolated({ MenuBarIcon.shared.image }) else { return "default image is not the chosen menu bar icon" }
+            let fitted = MenuBarIcon.fittedSize(NSSize(width: 400, height: 100))
+            guard fitted.height <= 18, fitted.width <= 30 else { return "custom icon not fitted: \(fitted)" }
+            guard MenuBarIconChoice(stored: nil) == .symbol("circle.grid.2x2"), MenuBarIconChoice(stored: "wheel") == .wheel,
+                  MenuBarIconChoice(stored: MenuBarIconChoice.symbol("moon").stored) == .symbol("moon") else { return "icon choice does not round-trip" }
             prefs.showIcon = false
             guard StatusComposer.pieces(prefs: prefs, snapshot: snapshot) == [.icon] else { return "the item can become empty" }
             prefs.widgets = [.cpu, .cpuGraph, .cpuBars, .gpu, .memory, .network, .disk, .temperature, .battery]

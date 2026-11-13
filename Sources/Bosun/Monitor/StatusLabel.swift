@@ -130,7 +130,7 @@ enum StatusRenderer {
     /// status item several times per change (once per display and menu bar style), and each
     /// snapshot would otherwise run the whole drawing again.
     static func image(_ pieces: [StatusPiece], scale: CGFloat = 2) -> NSImage {
-        if pieces == [.icon] { return WheelGlyph.menuBarImage }
+        if pieces == [.icon] { return MainActor.assumeIsolated { MenuBarIcon.shared.image } }
         let size = NSSize(width: max(1, ceil(StatusLayout.totalWidth(pieces))), height: StatusLayout.height)
         let image = NSImage(size: size)
         if let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
@@ -159,8 +159,9 @@ enum StatusRenderer {
         switch piece {
         case .icon:
             let side = StatusLayout.iconSize
-            WheelGlyph.draw(in: CGRect(x: rect.minX, y: rect.midY - side / 2, width: side, height: side).insetBy(dx: 0.5, dy: 0.5),
-                            color: ink)
+            MainActor.assumeIsolated {
+                MenuBarIcon.shared.draw(in: CGRect(x: rect.minX, y: rect.midY - side / 2, width: side, height: side))
+            }
         case let .value(caption, text, _):
             if let caption {
                 drawText(caption, StatusLayout.captionFont, ink.withAlphaComponent(0.7), in: rect, alignment: .center, baseline: 13.5)
@@ -280,12 +281,17 @@ enum StatusRenderer {
 /// published for the panel do not invalidate the menu bar label, and vice versa.
 @MainActor
 final class StatusModel: ObservableObject {
-    @Published private(set) var image: NSImage = WheelGlyph.menuBarImage
+    @Published private(set) var image: NSImage = MenuBarIcon.shared.image
     private(set) var pieces: [StatusPiece] = [.icon]
 
     func show(_ pieces: [StatusPiece]) {
         guard pieces != self.pieces else { return }
         self.pieces = pieces
+        render()
+    }
+
+    /// Redraws with the current pieces, e.g. after the user picked another icon.
+    func render() {
         image = StatusRenderer.image(pieces, scale: NSScreen.screens.map(\.backingScaleFactor).max() ?? 2)
     }
 }
@@ -302,9 +308,11 @@ struct StatusLabel: View {
 
 private struct StatusImage: View {
     @ObservedObject var model: StatusModel
+    @ObservedObject var icon = MenuBarIcon.shared
     let enabled: Bool
 
     var body: some View {
-        Image(nsImage: enabled ? model.image : WheelGlyph.menuBarImage)
+        Image(nsImage: enabled ? model.image : icon.image)
+            .onChange(of: icon.image) { model.render() }
     }
 }

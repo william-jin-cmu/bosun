@@ -2,6 +2,18 @@
 // Run via tools/make-icon.sh.
 import AppKit
 
+/// Draws a system symbol tinted `color`, aspect-fitted and centred in `rect`.
+func drawSymbol(_ name: String, in rect: CGRect, color: NSColor, weight: NSFont.Weight = .semibold) {
+    let configuration = NSImage.SymbolConfiguration(pointSize: rect.height, weight: weight)
+        .applying(.init(paletteColors: [color]))
+    guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+        .withSymbolConfiguration(configuration) else { return }
+    let scale = min(rect.width / symbol.size.width, rect.height / symbol.size.height)
+    let size = NSSize(width: symbol.size.width * scale, height: symbol.size.height * scale)
+    symbol.draw(in: CGRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height))
+}
+let mark = "circle.grid.2x2"
+
 func png(_ size: Int, _ draw: (CGRect) -> Void) -> Data {
     let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8,
                                samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -41,7 +53,7 @@ func appIcon(_ canvas: CGRect) {
                         NSColor(srgbRed: 0.45, green: 0.75, blue: 0.85, alpha: 0)])!
         .draw(in: NSBezierPath(ovalIn: plate.insetBy(dx: -60 * s, dy: -60 * s)), relativeCenterPosition: .zero)
 
-    let wheelRect = plate.insetBy(dx: 128 * s, dy: 128 * s)
+    let wheelRect = plate.insetBy(dx: 165 * s, dy: 165 * s)
     let lift = NSShadow()
     lift.shadowColor = NSColor.black.withAlphaComponent(0.45)
     lift.shadowBlurRadius = 18 * s
@@ -50,7 +62,7 @@ func appIcon(_ canvas: CGRect) {
     // One transparency layer so the shadow is cast by the whole wheel, not each stroke.
     let cg = NSGraphicsContext.current!.cgContext
     cg.beginTransparencyLayer(auxiliaryInfo: nil)
-    WheelGlyph.draw(in: wheelRect, color: NSColor(srgbRed: 0.96, green: 0.90, blue: 0.76, alpha: 1))
+    drawSymbol(mark, in: wheelRect, color: NSColor(srgbRed: 0.97, green: 0.95, blue: 0.90, alpha: 1))
     cg.endTransparencyLayer()
     NSGraphicsContext.restoreGraphicsState()
 
@@ -75,8 +87,8 @@ for base in [16, 32, 128, 256, 512] {
 try png(288) { rect in
     NSColor(white: 0.93, alpha: 1).setFill(); CGRect(x: 0, y: 0, width: 144, height: 288).fill()
     NSColor(white: 0.12, alpha: 1).setFill(); CGRect(x: 144, y: 0, width: 144, height: 288).fill()
-    WheelGlyph.draw(in: CGRect(x: 18, y: 162, width: 108, height: 108), color: .black)
-    WheelGlyph.draw(in: CGRect(x: 162, y: 162, width: 108, height: 108), color: .white)
-    WheelGlyph.draw(in: CGRect(x: 54, y: 60, width: 36, height: 36), color: .black)
-    WheelGlyph.draw(in: CGRect(x: 198, y: 60, width: 36, height: 36), color: .white)
+    drawSymbol(mark, in: CGRect(x: 18, y: 162, width: 108, height: 108).insetBy(dx: 12, dy: 12), color: .black, weight: .medium)
+    drawSymbol(mark, in: CGRect(x: 162, y: 162, width: 108, height: 108).insetBy(dx: 12, dy: 12), color: .white, weight: .medium)
+    drawSymbol(mark, in: CGRect(x: 54, y: 60, width: 36, height: 36).insetBy(dx: 12, dy: 12), color: .black, weight: .medium)
+    drawSymbol(mark, in: CGRect(x: 198, y: 60, width: 36, height: 36).insetBy(dx: 12, dy: 12), color: .white, weight: .medium)
 }.write(to: out.appendingPathComponent("glyph-preview.png"))

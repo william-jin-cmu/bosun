@@ -22,6 +22,9 @@ struct GeneralSettings: View {
                     PermissionRow(item: item, center: permissions)
                 }
             }
+            GeneralGroup("Menu bar icon") {
+                MenuBarIconPicker(icon: MenuBarIcon.shared)
+            }
             GeneralGroup("Startup") {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
