@@ -334,7 +334,7 @@ private struct DisplayCard: View {
         SettingsGroup(title: display.name) {
             Row(label: status) {
                 Toggle("Control this display", isOn: module.binding(key, \.enabled))
-                    .toggleStyle(.switch).controlSize(.small)
+                    .toggleStyle(.switch).controlSize(.mini).controlSize(.small)
             }
             .foregroundStyle(.secondary)
 

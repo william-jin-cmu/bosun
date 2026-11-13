@@ -72,7 +72,8 @@ struct SettingsView: View {
                     if let module = module(for: selection.tab) {
                         Toggle("Enable \(module.title)", isOn: Binding(
                             get: { state.isEnabled(module) }, set: { state.setEnabled(module, $0) }))
-                            .toggleStyle(.switch)
+                            .toggleStyle(.switch).controlSize(.mini)
+                            .font(.headline)
                         Divider()
                     }
                     switch selection.tab {
@@ -86,6 +87,9 @@ struct SettingsView: View {
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Compact controls throughout: the default-size switches and
+                // buttons look heavy in a dense settings page.
+                .controlSize(.small)
             }
             .navigationTitle(selection.tab.title)
         }

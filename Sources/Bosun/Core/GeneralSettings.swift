@@ -8,7 +8,7 @@ struct GeneralSettings: View {
     @StateObject private var permissions = PermissionCenter()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        VStack(alignment: .leading, spacing: 18) {
             header
             GeneralGroup("Modules") {
                 ForEach(Array(moduleRows.enumerated()), id: \.offset) { index, row in
@@ -34,7 +34,7 @@ struct GeneralSettings: View {
                     Spacer()
                     Toggle("Open Bosun at login", isOn: Binding(
                         get: { state.launchAtLogin }, set: { state.setLaunchAtLogin($0) }))
-                        .toggleStyle(.switch).labelsHidden()
+                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
                 }
                 .padding(.vertical, 2)
             }
@@ -46,10 +46,10 @@ struct GeneralSettings: View {
     private var header: some View {
         HStack(spacing: 14) {
             Image(nsImage: NSApp.applicationIconImage)
-                .resizable().frame(width: 64, height: 64)
+                .resizable().frame(width: 52, height: 52)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Bosun").font(.title.weight(.semibold))
+                Text("Bosun").font(.title2.weight(.semibold))
                 Text("One menu bar item for system stats, displays, sound, screen color and keyboard.")
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -85,8 +85,8 @@ private struct GeneralGroup<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title).font(.headline)
-            VStack(alignment: .leading, spacing: 10) { content() }
-                .padding(.horizontal, 14).padding(.vertical, 12)
+            VStack(alignment: .leading, spacing: 8) { content() }
+                .padding(.horizontal, 12).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
             if let footnote {
@@ -102,10 +102,10 @@ private struct IconTile: View {
     var tint: Color = .accentColor
     var body: some View {
         Image(systemName: symbol)
-            .font(.system(size: 14, weight: .medium))
+            .font(.system(size: 12, weight: .medium))
             .foregroundStyle(.white)
-            .frame(width: 28, height: 28)
-            .background(tint.gradient, in: RoundedRectangle(cornerRadius: 7))
+            .frame(width: 24, height: 24)
+            .background(tint.gradient, in: RoundedRectangle(cornerRadius: 6))
             .accessibilityHidden(true)
     }
 }
@@ -124,12 +124,15 @@ private struct ModuleRow: View {
                 Text(summary).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Settings") { SettingsWindow.show(tab) }
-                .controlSize(.small)
-                .accessibilityLabel("\(module.title) settings")
             Toggle(module.title, isOn: Binding(
                 get: { state.isEnabled(module) }, set: { state.setEnabled(module, $0) }))
-                .toggleStyle(.switch).labelsHidden()
+                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            Button { SettingsWindow.show(tab) } label: {
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.borderless).foregroundStyle(.secondary)
+            .help("\(module.title) settings")
+            .accessibilityLabel("\(module.title) settings")
         }
     }
 }
