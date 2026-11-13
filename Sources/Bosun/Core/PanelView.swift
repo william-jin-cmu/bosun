@@ -2,7 +2,7 @@ import SwiftUI
 
 struct PanelView: View {
     @ObservedObject var state: AppState
-    @AppStorage("status.style") private var style: StatusStyle = .cpu
+    @AppStorage("status.style") private var style: StatusStyle = .icon
     @State private var contentHeight: CGFloat = 400
     /// Set by the off-screen snapshot, which wants the whole panel unclipped.
     var unboundedHeight = false

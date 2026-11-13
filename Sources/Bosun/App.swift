@@ -40,12 +40,12 @@ enum StatusStyle: String, CaseIterable, Identifiable {
 struct StatusLabel: View {
     @ObservedObject var monitor: MonitorModule
     let monitorEnabled: Bool
-    @AppStorage("status.style") private var style: StatusStyle = .cpu
+    @AppStorage("status.style") private var style: StatusStyle = .icon
 
     var body: some View {
         let text = monitorEnabled ? monitor.statusText(style) : nil
         HStack(spacing: 3) {
-            Image(systemName: "gauge.with.dots.needle.33percent")
+            Image(nsImage: WheelGlyph.menuBarImage)
             if let text { Text(text).monospacedDigit() }
         }
     }
