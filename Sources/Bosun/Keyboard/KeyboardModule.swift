@@ -298,7 +298,9 @@ final class KeyboardModule: ObservableObject, BosunModule {
         size = capacity * MemoryLayout<kinfo_proc>.stride
         guard sysctl(&mib, 3, &procs, &size, nil, 0) == 0 else { return false }
         // p_comm holds at most 16 characters, so compare prefixes.
-        let names = ["karabiner_grabber", "Karabiner-Core-Service"].map { String($0.prefix(16)) }
+        // The root Core-Service daemon keeps running after "Quit Karabiner-Elements";
+        // only the per-user server means Karabiner is actually remapping.
+        let names = ["karabiner_console_user_server", "Karabiner-Console-User-Server"].map { String($0.prefix(16)) }
         for index in 0..<(size / MemoryLayout<kinfo_proc>.stride) {
             let name = withUnsafeBytes(of: &procs[index].kp_proc.p_comm) { raw in
                 String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
