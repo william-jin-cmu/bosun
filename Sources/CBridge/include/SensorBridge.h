@@ -54,6 +54,7 @@ enum {
 
 enum {
     kBosunSMCReadBytes   = 5,
+    kBosunSMCReadKeyAtIndex = 8,   // data32 = index, returns the key
     kBosunSMCReadKeyInfo = 9,
 };
 

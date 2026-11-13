@@ -24,29 +24,4 @@ struct BosunApp: App {
     }
 }
 
-enum StatusStyle: String, CaseIterable, Identifiable {
-    case icon, cpu, cpuMemory, network
-    var id: String { rawValue }
-    var label: String {
-        switch self {
-        case .icon: "Icon only"
-        case .cpu: "CPU"
-        case .cpuMemory: "CPU and memory"
-        case .network: "Network speed"
-        }
-    }
-}
-
-struct StatusLabel: View {
-    @ObservedObject var monitor: MonitorModule
-    let monitorEnabled: Bool
-    @AppStorage("status.style") private var style: StatusStyle = .icon
-
-    var body: some View {
-        let text = monitorEnabled ? monitor.statusText(style) : nil
-        HStack(spacing: 3) {
-            Image(nsImage: WheelGlyph.menuBarImage)
-            if let text { Text(text).monospacedDigit() }
-        }
-    }
-}
+// The menu bar label (`StatusLabel`) lives in Monitor/StatusLabel.swift.

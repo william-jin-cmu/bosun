@@ -1,3 +1,4 @@
+import AVFoundation
 import AudioToolbox
 import CoreAudio
 import Foundation
@@ -109,10 +110,42 @@ final class AudioListener {
     }
 }
 
-struct AudioDeviceInfo: Identifiable, Hashable {
+/// Everything the UI shows about one device in one direction.
+struct AudioDeviceState: Identifiable, Equatable {
     let id: AudioDeviceID
     let uid: String
     let name: String
+    let transport: UInt32
+    let isAggregate: Bool
+    /// A "Multi-Output Device": every sub-device plays the same audio.
+    let isMultiOutput: Bool
+    /// Streams in this direction.
+    let streamCount: Int
+    var volume: Float?
+    var canSetVolume: Bool
+    var isMuted: Bool
+    var canMute: Bool
+    /// 0 = left, 0.5 = centre, 1 = right; nil when the device has no balance control.
+    var balance: Float?
+    var sampleRate: Double
+    /// Rates the device can be switched to (empty or one entry: nothing to choose).
+    var sampleRates: [Double]
+    /// 0-based channel indexes of the device's stereo pair.
+    var stereoLeft: Int
+    var stereoRight: Int
+
+    var symbol: String {
+        switch transport {
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: "headphones"
+        case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort: "display"
+        case kAudioDeviceTransportTypeAirPlay: "airplayaudio"
+        case kAudioDeviceTransportTypeUSB, kAudioDeviceTransportTypeThunderbolt, kAudioDeviceTransportTypeFireWire: "cable.connector"
+        case kAudioDeviceTransportTypeAggregate: "square.stack.3d.up"
+        case kAudioDeviceTransportTypeVirtual: "waveform"
+        case kAudioDeviceTransportTypeContinuityCaptureWired, kAudioDeviceTransportTypeContinuityCaptureWireless: "iphone"
+        default: "hifispeaker"
+        }
+    }
 }
 
 enum AudioDevices {
@@ -126,25 +159,74 @@ enum AudioDevices {
         }
     }
 
-    /// UID prefix of the private aggregate devices Bosun creates for per-app volume.
-    static let privateUIDPrefix = "Bosun-Tap-"
+    /// UID prefix of the private aggregate devices Bosun creates for per-app
+    /// volume, and name prefix of its taps. The owning PID follows the prefix.
+    static let privatePrefix = "Bosun-Tap-"
+
+    static func allDeviceIDs() -> [AudioDeviceID] {
+        CA.objectIDs(CA.system, CA.address(kAudioHardwarePropertyDevices))
+    }
 
     /// Devices the user could pick as default for `direction`.
-    static func list(_ direction: Direction) -> [AudioDeviceInfo] {
-        CA.objectIDs(CA.system, CA.address(kAudioHardwarePropertyDevices)).compactMap { id in
-            guard !CA.objectIDs(id, CA.address(kAudioDevicePropertyStreams, scope: direction.scope)).isEmpty,
-                  let uid = uid(id), !uid.hasPrefix(privateUIDPrefix) else { return nil }
-            let canBeDefault = CA.value(
-                id, CA.address(kAudioDevicePropertyDeviceCanBeDefaultDevice, scope: direction.scope), initial: UInt32(1))
-            let hidden = CA.value(id, CA.address(kAudioDevicePropertyIsHidden), initial: UInt32(0))
-            guard canBeDefault != 0, (hidden ?? 0) == 0 else { return nil }
-            let name = CA.string(id, CA.address(kAudioObjectPropertyName)) ?? "Unknown Device"
-            return AudioDeviceInfo(id: id, uid: uid, name: name)
-        }
+    static func list(_ direction: Direction) -> [AudioDeviceState] {
+        allDeviceIDs().compactMap { state($0, direction) }
+    }
+
+    static func state(_ id: AudioDeviceID, _ direction: Direction) -> AudioDeviceState? {
+        let streams = CA.objectIDs(id, CA.address(kAudioDevicePropertyStreams, scope: direction.scope)).count
+        guard streams > 0, let uid = uid(id), !uid.hasPrefix(privatePrefix) else { return nil }
+        let canBeDefault = CA.value(
+            id, CA.address(kAudioDevicePropertyDeviceCanBeDefaultDevice, scope: direction.scope), initial: UInt32(1))
+        let hidden = CA.value(id, CA.address(kAudioDevicePropertyIsHidden), initial: UInt32(0))
+        guard canBeDefault != 0, (hidden ?? 0) == 0 else { return nil }
+        let stereo = CA.value(
+            id, CA.address(kAudioDevicePropertyPreferredChannelsForStereo, scope: direction.scope),
+            initial: (UInt32(1), UInt32(2))) ?? (1, 2)
+        let balance = balanceAddress(id)
+        return AudioDeviceState(
+            id: id, uid: uid,
+            name: CA.string(id, CA.address(kAudioObjectPropertyName)) ?? "Unknown Device",
+            transport: CA.value(id, CA.address(kAudioDevicePropertyTransportType), initial: UInt32(0)) ?? 0,
+            isAggregate: isAggregate(id),
+            isMultiOutput: isMultiOutput(id),
+            streamCount: streams,
+            volume: volume(id, direction),
+            canSetVolume: canSetVolume(id, direction),
+            isMuted: isMuted(id, direction) ?? false,
+            canMute: canMute(id, direction),
+            balance: direction == .output ? balance.flatMap { CA.value(id, $0, initial: Float32(0.5)) } : nil,
+            sampleRate: sampleRate(id) ?? 0,
+            sampleRates: availableSampleRates(id),
+            stereoLeft: max(0, Int(stereo.0) - 1),
+            stereoRight: max(0, Int(stereo.1) - 1))
     }
 
     static func uid(_ device: AudioDeviceID) -> String? {
         CA.string(device, CA.address(kAudioDevicePropertyDeviceUID))
+    }
+
+    static func device(uid: String) -> AudioDeviceID? {
+        allDeviceIDs().first { self.uid($0) == uid }
+    }
+
+    static func isAggregate(_ device: AudioDeviceID) -> Bool {
+        CA.value(device, CA.address(kAudioObjectPropertyClass), initial: AudioClassID(0)) == kAudioAggregateDeviceClassID
+    }
+
+    /// The dictionary an aggregate device was built from (sub-devices, clock, stacking).
+    static func composition(_ device: AudioDeviceID) -> [String: Any]? {
+        guard isAggregate(device) else { return nil }
+        var address = CA.address(kAudioAggregateDevicePropertyComposition)
+        var ref: Unmanaged<CFDictionary>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFDictionary>?>.size)
+        let status = withUnsafeMutablePointer(to: &ref) { AudioObjectGetPropertyData(device, &address, 0, nil, &size, $0) }
+        guard status == noErr, let ref else { return nil }
+        return ref.takeRetainedValue() as? [String: Any]
+    }
+
+    static func isMultiOutput(_ device: AudioDeviceID) -> Bool {
+        guard let composition = composition(device) else { return false }
+        return (composition[kAudioAggregateDeviceIsStackedKey] as? NSNumber)?.boolValue ?? false
     }
 
     static func defaultDevice(_ direction: Direction) -> AudioDeviceID? {
@@ -163,35 +245,79 @@ enum AudioDevices {
         return ok
     }
 
-    // MARK: Master volume
+    // MARK: Volume, mute, balance
 
-    private static let volumeAddress = CA.address(
-        kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope: kAudioObjectPropertyScopeOutput)
-    private static let muteAddress = CA.address(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput)
-
-    static var volumeSelector: AudioObjectPropertyAddress { volumeAddress }
-    static var muteSelector: AudioObjectPropertyAddress { muteAddress }
-
-    static func volume(_ device: AudioDeviceID) -> Float? {
-        CA.value(device, volumeAddress, initial: Float32(0))
+    static func volumeAddress(_ direction: Direction) -> AudioObjectPropertyAddress {
+        CA.address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope: direction.scope)
+    }
+    static func muteAddress(_ direction: Direction) -> AudioObjectPropertyAddress {
+        CA.address(kAudioDevicePropertyMute, scope: direction.scope)
+    }
+    /// Devices expose balance either as the virtual main balance or as a stereo pan.
+    static func balanceAddress(_ device: AudioDeviceID) -> AudioObjectPropertyAddress? {
+        let candidates = [
+            CA.address(kAudioHardwareServiceDeviceProperty_VirtualMainBalance, scope: kAudioObjectPropertyScopeOutput),
+            CA.address(kAudioDevicePropertyStereoPan, scope: kAudioObjectPropertyScopeOutput),
+        ]
+        return candidates.first { CA.isSettable(device, $0) }
     }
 
-    static func canSetVolume(_ device: AudioDeviceID) -> Bool { CA.isSettable(device, volumeAddress) }
+    static func volume(_ device: AudioDeviceID, _ direction: Direction = .output) -> Float? {
+        CA.value(device, volumeAddress(direction), initial: Float32(0))
+    }
+    static func canSetVolume(_ device: AudioDeviceID, _ direction: Direction = .output) -> Bool {
+        CA.isSettable(device, volumeAddress(direction))
+    }
+    @discardableResult
+    static func setVolume(_ device: AudioDeviceID, _ volume: Float, _ direction: Direction = .output) -> Bool {
+        CA.set(device, volumeAddress(direction), Float32(min(max(volume, 0), 1))) == noErr
+    }
+    static func isMuted(_ device: AudioDeviceID, _ direction: Direction = .output) -> Bool? {
+        CA.value(device, muteAddress(direction), initial: UInt32(0)).map { $0 != 0 }
+    }
+    static func canMute(_ device: AudioDeviceID, _ direction: Direction = .output) -> Bool {
+        CA.isSettable(device, muteAddress(direction))
+    }
+    @discardableResult
+    static func setMuted(_ device: AudioDeviceID, _ muted: Bool, _ direction: Direction = .output) -> Bool {
+        CA.set(device, muteAddress(direction), UInt32(muted ? 1 : 0)) == noErr
+    }
+    static func balance(_ device: AudioDeviceID) -> Float? {
+        balanceAddress(device).flatMap { CA.value(device, $0, initial: Float32(0.5)) }
+    }
+    @discardableResult
+    static func setBalance(_ device: AudioDeviceID, _ balance: Float) -> Bool {
+        guard let address = balanceAddress(device) else { return false }
+        return CA.set(device, address, Float32(min(max(balance, 0), 1))) == noErr
+    }
+
+    // MARK: Sample rate
+
+    static func sampleRate(_ device: AudioDeviceID) -> Double? {
+        CA.value(device, CA.address(kAudioDevicePropertyNominalSampleRate), initial: Float64(0))
+    }
+
+    static func availableSampleRates(_ device: AudioDeviceID) -> [Double] {
+        var address = CA.address(kAudioDevicePropertyAvailableNominalSampleRates)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ranges = [AudioValueRange](
+            repeating: AudioValueRange(), count: Int(size) / MemoryLayout<AudioValueRange>.size)
+        let status = ranges.withUnsafeMutableBytes {
+            AudioObjectGetPropertyData(device, &address, 0, nil, &size, $0.baseAddress!)
+        }
+        guard status == noErr else { return [] }
+        return AudioMath.discreteRates(ranges.map { ($0.mMinimum, $0.mMaximum) })
+    }
 
     @discardableResult
-    static func setVolume(_ device: AudioDeviceID, _ volume: Float) -> Bool {
-        CA.set(device, volumeAddress, Float32(min(max(volume, 0), 1))) == noErr
+    static func setSampleRate(_ device: AudioDeviceID, _ rate: Double) -> Bool {
+        CA.set(device, CA.address(kAudioDevicePropertyNominalSampleRate), Float64(rate)) == noErr
     }
 
-    static func isMuted(_ device: AudioDeviceID) -> Bool? {
-        CA.value(device, muteAddress, initial: UInt32(0)).map { $0 != 0 }
-    }
-
-    static func canMute(_ device: AudioDeviceID) -> Bool { CA.isSettable(device, muteAddress) }
-
-    @discardableResult
-    static func setMuted(_ device: AudioDeviceID, _ muted: Bool) -> Bool {
-        CA.set(device, muteAddress, UInt32(muted ? 1 : 0)) == noErr
+    /// Devices (by ID) the process is currently playing on.
+    static func outputDevices(ofProcess object: AudioObjectID) -> [AudioDeviceID] {
+        CA.objectIDs(object, CA.address(kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput))
     }
 }
 
@@ -239,11 +365,24 @@ enum AudioCaptureAccess: Equatable {
         string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture")!
 }
 
-enum AudioMath {
-    /// Slider position (0…1) to linear gain. Squared so the lower half of the
-    /// slider is usable: 50% is about −12 dB. Never above unity.
-    static func gain(forSlider value: Double) -> Float {
-        let v = min(max(value, 0), 1)
-        return Float(v * v)
+/// Microphone consent, needed only for the input level meter.
+enum AudioMicAccess {
+    static var status: AVAuthorizationStatus { AVCaptureDevice.authorizationStatus(for: .audio) }
+
+    /// macOS terminates a process that asks for the microphone without a usage
+    /// string, so the prompt is only ever shown when the bundle declares one.
+    static var canRequest: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") != nil
     }
+
+    @MainActor
+    static func request(_ completion: @escaping @MainActor (Bool) -> Void) {
+        guard canRequest else { return completion(false) }
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(granted) } }
+        }
+    }
+
+    static let settingsURL = URL(
+        string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone")!
 }

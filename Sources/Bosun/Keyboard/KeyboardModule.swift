@@ -1,9 +1,10 @@
 import ApplicationServices
 import SwiftUI
 
-/// Replaces a small Karabiner-Elements config without a driver: key-to-key
-/// remaps go through the HID event system (`hidutil`), and "while Caps Lock is
-/// held" layers through an event tap that needs Accessibility permission.
+/// A driverless key remapper. Key → key remaps go through the HID event system
+/// (`hidutil`); shortcuts, layers and tap/hold keys through an event tap, which
+/// needs Accessibility permission. `KeyCompiler` turns the user's rules into
+/// both halves.
 @MainActor
 final class KeyboardModule: ObservableObject, BosunModule {
     let id = "keyboard"
@@ -11,38 +12,52 @@ final class KeyboardModule: ObservableObject, BosunModule {
     let symbol = "keyboard"
     let enabledByDefault = false
 
-    @Published private(set) var rules = KeyboardRules.load()
-    @Published private(set) var plainArrows = UserDefaults.standard.bool(forKey: KeyboardRules.plainArrowsKey)
+    @Published private(set) var rules: [KeyRule]
+    @Published private(set) var program: KeyProgram
     @Published private(set) var isRunning = false
     @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
     @Published private(set) var tapRunning = false
+    @Published private(set) var tapLocation: KeyTap.Location?
     /// nil while the key remaps are in place, else what went wrong.
     @Published private(set) var mappingError: String?
     @Published private(set) var karabinerRunning = false
+    @Published private(set) var keyboards: [KeyboardDevice] = []
 
     private static let appliedKey = "keyboard.appliedMapping"
     private let tap = KeyTap()
     private var timer: Timer?
-    private var wakeObserver: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
     private var panelVisible = false
+    private var recording: RecordingMode?
+
+    init() {
+        let rules = KeyRuleSet.load().rules
+        self.rules = rules
+        program = KeyCompiler.compile(rules)
+        tap.onLaunch = { bundleID in DispatchQueue.main.async { Self.open(bundleID) } }
+        tap.onCapsLock = { CapsLock.pressed(long: $0) }
+    }
 
     // MARK: BosunModule
 
     func start() {
         guard !isRunning else { return }
         isRunning = true
-        applyMapping()
-        syncTap()
-        refreshStatus()
-        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
+        tap.setFrontApp(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        let center = NSWorkspace.shared.notificationCenter
+        observers = [
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 // The mapping can be lost across sleep.
-                self?.applyMapping()
-                self?.syncTap()
-            }
-        }
+                MainActor.assumeIsolated { self?.sync() }
+            },
+            center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                let bundleID = app?.bundleIdentifier
+                MainActor.assumeIsolated { self?.tap.setFrontApp(bundleID) }
+            },
+        ]
+        sync()
+        refreshStatus()
         scheduleTimer()
     }
 
@@ -51,11 +66,12 @@ final class KeyboardModule: ObservableObject, BosunModule {
         isRunning = false
         timer?.invalidate()
         timer = nil
-        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
-        wakeObserver = nil
+        observers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
+        observers = []
         tap.stop()
         tapRunning = false
-        removeMapping()
+        tapLocation = nil
+        applyMapping()
     }
 
     func panelVisibilityChanged(_ visible: Bool) {
@@ -65,58 +81,112 @@ final class KeyboardModule: ObservableObject, BosunModule {
         scheduleTimer()
     }
 
-    // MARK: Settings
+    // MARK: Editing
 
-    func setRemap(_ id: String, enabled: Bool) {
-        guard let index = rules.remaps.firstIndex(where: { $0.id == id }) else { return }
-        rules.remaps[index].enabled = enabled
+    func rule(_ id: String) -> KeyRule? { rules.first { $0.id == id } }
+
+    func setEnabled(_ id: String, _ enabled: Bool) {
+        guard let index = rules.firstIndex(where: { $0.id == id }) else { return }
+        rules[index].enabled = enabled
         rulesChanged()
     }
 
-    func setLayer(_ id: String, enabled: Bool) {
-        guard let index = rules.layers.firstIndex(where: { $0.id == id }) else { return }
-        rules.layers[index].enabled = enabled
+    /// Replaces the rule with the same id, or appends it.
+    func save(_ rule: KeyRule) {
+        if let index = rules.firstIndex(where: { $0.id == rule.id }) { rules[index] = rule } else { rules.append(rule) }
         rulesChanged()
     }
 
-    func setPlainArrows(_ on: Bool) {
-        plainArrows = on
-        UserDefaults.standard.set(on, forKey: KeyboardRules.plainArrowsKey)
-        syncTap()
+    func add(_ new: [KeyRule]) {
+        guard !new.isEmpty else { return }
+        rules.append(contentsOf: new)
+        rulesChanged()
     }
+
+    func delete(_ id: String) {
+        rules.removeAll { $0.id == id }
+        rulesChanged()
+    }
+
+    func duplicate(_ id: String) {
+        guard let index = rules.firstIndex(where: { $0.id == id }) else { return }
+        var copy = KeyPreset(id: "", title: "", detail: "", rules: [rules[index]]).instantiate()[0]
+        if !copy.name.isEmpty { copy.name += " copy" }
+        rules.insert(copy, at: index + 1)
+        rulesChanged()
+    }
+
+    func move(_ id: String, by offset: Int) {
+        guard let index = rules.firstIndex(where: { $0.id == id }) else { return }
+        let target = index + offset
+        guard rules.indices.contains(target) else { return }
+        rules.swapAt(index, target)
+        rulesChanged()
+    }
+
+    func move(fromOffsets: IndexSet, toOffset: Int) {
+        rules.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        rulesChanged()
+    }
+
+    func issues(_ id: String) -> [KeyProgram.Issue] { program.issues[id] ?? [] }
 
     private func rulesChanged() {
-        rules.save()
-        guard isRunning else { return }
-        applyMapping()
-        syncTap()
+        KeyRuleSet(rules: rules).save()
+        program = KeyCompiler.compile(rules)
+        if isRunning { sync() }
+    }
+
+    // MARK: Key recorder support
+
+    enum RecordingMode {
+        /// The key as the keyboard sends it: all of Bosun's remaps are lifted.
+        case physical
+        /// The key as the event tap will see it: only the automatic Caps Lock
+        /// carrier is lifted, so Caps Lock records as Caps Lock.
+        case logical
+    }
+
+    /// The recorder must see the user's real keys, not what the rules make of them.
+    func beginRecording(_ mode: RecordingMode) {
+        recording = mode
+        tap.setPaused(true)
+        if isRunning { applyMapping() }
+    }
+
+    func endRecording() {
+        guard recording != nil else { return }
+        recording = nil
+        tap.setPaused(false)
+        if isRunning { applyMapping() }
+    }
+
+    func refreshKeyboards() {
+        keyboards = HIDMapping.keyboards()
     }
 
     // MARK: Accessibility
 
-    var needsTap: Bool { !rules.activeLayers.isEmpty }
+    var needsTap: Bool { program.needsTap }
 
     /// Shows the system prompt (first time only) and opens the settings pane.
     func requestAccessibility() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
+        Accessibility.prompt()
+        Accessibility.openSettings()
         scheduleTimer()
     }
 
     // MARK: Polling
 
     /// Permission can be granted or revoked while the panel is closed (opening
-    /// System Settings closes it), so this runs whenever the module is on:
-    /// quickly while waiting for permission, lazily once the tap is up.
+    /// System Settings closes it), keyboards come and go, and other tools may
+    /// rewrite the mapping, so this runs whenever the module is on: quickly
+    /// while waiting for permission, lazily otherwise.
     private func scheduleTimer() {
         timer?.invalidate()
         timer = nil
         guard isRunning else { return }
         let waiting = needsTap && !tapRunning
-        guard waiting || panelVisible || tapRunning else { return }
         let interval: TimeInterval = waiting ? (panelVisible ? 1 : 2) : (panelVisible ? 3 : 15)
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -128,7 +198,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
 
     private func tick() {
         let wasRunning = tapRunning
-        syncTap()
+        sync(quiet: true)
         refreshStatus()
         if wasRunning != tapRunning { scheduleTimer() }
     }
@@ -137,15 +207,21 @@ final class KeyboardModule: ObservableObject, BosunModule {
         if panelVisible { karabinerRunning = Self.detectKarabiner() }
     }
 
+    /// Brings the tap and the system mapping in line with the rules.
+    private func sync(quiet: Bool = false) {
+        syncTap()
+        applyMapping(quiet: quiet)
+    }
+
     // MARK: Event tap
 
     private func syncTap() {
         let trusted = AXIsProcessTrusted()
         if trusted != accessibilityGranted { accessibilityGranted = trusted }
-        tap.update(.init(layers: rules.activeLayers, plainArrows: plainArrows))
+        tap.update(program.tap)
         let wanted = isRunning && needsTap && trusted
         if wanted, !tap.isRunning {
-            if tap.start() { Log.info("event tap started", "keyboard") }
+            if tap.start() { Log.info("event tap started at the \(tap.location?.rawValue ?? "?") level", "keyboard") }
         } else if !wanted, tap.isRunning {
             // Also reached when permission is revoked: a tap left behind then
             // would swallow every keystroke.
@@ -153,6 +229,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
             Log.info("event tap stopped", "keyboard")
         }
         if tapRunning != tap.isRunning { tapRunning = tap.isRunning }
+        if tapLocation != tap.location { tapLocation = tap.location }
     }
 
     // MARK: hidutil mapping
@@ -171,38 +248,45 @@ final class KeyboardModule: ObservableObject, BosunModule {
         }
     }
 
-    /// Puts the enabled remaps into the system mapping, keeping foreign entries.
-    /// Safe to repeat: whatever Bosun wrote before (even in a run that crashed)
-    /// is taken out first.
-    private func applyMapping() {
-        let current = HIDMapping.read()
-        let base = storedApplied.map { HIDMapping.unmerge(current: current, applied: $0) } ?? current
-        let (merged, applied) = HIDMapping.merge(existing: base, ours: rules.activeRemaps)
-        if merged != current, let failure = HIDMapping.write(merged) {
-            mappingError = failure
-            Log.info("apply failed: \(failure)", "keyboard")
+    /// What should be in the system mapping right now.
+    private var desiredMapping: HIDMapping.Desired {
+        guard isRunning, recording != .physical else { return .init() }
+        // Without the tap to swallow it, a carried Caps Lock would be a dead key.
+        let carriers = tap.isRunning && recording == nil ? [] : program.carriers
+        return .init(global: program.global.filter { !carriers.contains($0) }, devices: program.devices)
+    }
+
+    /// Makes the system mapping "everyone else's entries plus ours", per
+    /// keyboard where a rule asks for it. Safe to repeat: whatever Bosun wrote
+    /// before (even in a run that crashed) is taken out first, and nothing is
+    /// written when the system already matches.
+    private func applyMapping(quiet: Bool = false) {
+        let plan = HIDMapping.plan(current: HIDMapping.snapshot(), previous: storedApplied, desired: desiredMapping)
+        if plan.isNoop {
+            storedApplied = plan.applied.isEmpty || !isRunning ? nil : plan.applied
             return
         }
-        storedApplied = applied.ours.isEmpty && applied.displaced.isEmpty ? nil : applied
-        let missing = applied.ours.filter { !HIDMapping.read().contains($0) }
-        mappingError = missing.isEmpty ? nil : "The system did not keep the mapping"
-        Log.info("mapping applied: \(applied.ours.count) ours, \(merged.count) total", "keyboard")
-    }
-
-    private func removeMapping() {
-        guard let applied = storedApplied else { return }
-        let current = HIDMapping.read()
-        let restored = HIDMapping.unmerge(current: current, applied: applied)
-        if restored != current, let failure = HIDMapping.write(restored) {
-            Log.info("restore failed: \(failure)", "keyboard")
-            return   // keep the record so the next start can still clean up
+        if let failure = HIDMapping.execute(plan) {
+            mappingError = failure
+            Log.info("mapping failed: \(failure)", "keyboard")
+            return       // keep the old record so a later attempt can still clean up
         }
-        storedApplied = nil
-        mappingError = nil
-        Log.info("mapping restored: \(restored.count) entries left", "keyboard")
+        storedApplied = plan.applied.isEmpty || !isRunning ? nil : plan.applied
+        let after = HIDMapping.plan(current: HIDMapping.snapshot(), previous: storedApplied, desired: desiredMapping)
+        mappingError = after.isNoop ? nil : "The system did not keep the mapping"
+        Log.info("mapping written: \(plan.applied.ours.count) global, \(plan.applied.devices.reduce(0) { $0 + $1.ours.count }) per keyboard"
+                 + (quiet ? " (had drifted)" : ""), "keyboard")
     }
 
-    // MARK: Karabiner
+    // MARK: Helpers
+
+    private static func open(_ bundleID: String) {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            Log.info("no app with bundle id \(bundleID)", "keyboard")
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
 
     /// Karabiner-Elements grabs the keyboard itself; while it runs, both remap.
     nonisolated static func detectKarabiner() -> Bool {

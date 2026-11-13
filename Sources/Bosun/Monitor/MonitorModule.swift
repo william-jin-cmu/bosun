@@ -1,141 +1,141 @@
 import SwiftUI
 
+/// The System module: samples on a utility queue and hands results to the main actor
+/// only when something on screen needs them.
+///
+/// Cost model. Every tick reads three kernel counters (CPU ticks, VM statistics,
+/// interface byte counts) so the history graphs are already filled when the panel
+/// opens. Everything else (GPU, SMC sensors, battery, volumes, disk I/O, processes) is
+/// read only for a block that is on screen, a menu bar widget that shows it, or an alert
+/// that watches it. With the panel closed, no widgets and no alerts, a tick never
+/// reaches the main thread at all.
 @MainActor
 final class MonitorModule: ObservableObject, BosunModule {
     let id = "monitor"
     let title = "System"
     let symbol = "cpu"
 
-    @Published private(set) var cpu: Double = 0
-    @Published private(set) var cores: [Double] = []
-    @Published private(set) var cpuHistory: [Double] = []
-    @Published private(set) var memory = MemoryUsage()
-    @Published private(set) var down: Double = 0
-    @Published private(set) var up: Double = 0
-    @Published private(set) var disk = DiskUsage()
-    @Published private(set) var battery: BatteryInfo?
-    @Published private(set) var sensors = SensorReading()
-    @Published private(set) var topProcesses: [ProcessLoad] = []
+    @Published private(set) var snapshot = MonitorSnapshot()
+    @Published var prefs: MonitorPrefs {
+        didSet {
+            guard prefs != oldValue else { return }
+            prefs.save(changedFrom: oldValue)
+            if prefs.interval != oldValue.interval, timer != nil { schedule() }
+            if !prefs.alertsEnabled.subtracting(oldValue.alertsEnabled).isEmpty, notifier.status != .authorized {
+                notifier.requestAuthorization()
+            }
+            apply()
+        }
+    }
+    /// The rendered menu bar item; observed by the label only.
+    let status = StatusModel()
+    let notifier = MonitorNotifier()
 
-    static let interval: TimeInterval = 2
-    static let historyLength = 60
+    private var panelVisible = false
+    private var settingsVisible = false
+    private var timer: DispatchSourceTimer?
 
     private let queue = DispatchQueue(label: "bosun.monitor", qos: .utility)
     // Touched only on `queue`.
-    nonisolated(unsafe) private let cpuSampler = CPUSampler()
-    nonisolated(unsafe) private let networkSampler = NetworkSampler()
-    private var timer: DispatchSourceTimer?
+    nonisolated(unsafe) private let sampler = MonitorSampler()
+    nonisolated(unsafe) private var queueNeeds = MonitorNeeds()
+    nonisolated(unsafe) private var queuePrefs = MonitorPrefs()
+    nonisolated(unsafe) private var queuePieces: [StatusPiece] = [.icon]
+    nonisolated(unsafe) private var queueRunning = false
+
+    init() {
+        prefs = MonitorPrefs.load()
+    }
 
     func start() {
         guard timer == nil else { return }
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: Self.interval, leeway: .milliseconds(200))
-        timer.setEventHandler { [weak self] in self?.sampleOnQueue() }
-        timer.resume()
-        self.timer = timer
+        apply(running: true)
+        schedule()
+        if !prefs.alertsEnabled.isEmpty { notifier.refresh() }
     }
 
     func stop() {
         timer?.cancel()
         timer = nil
+        panelVisible = false
+        status.show([.icon])
+        queue.async { [weak self] in
+            self?.queueRunning = false
+            self?.queuePieces = [.icon]
+        }
     }
 
     func panelVisibilityChanged(_ visible: Bool) {
+        guard panelVisible != visible else { return }
+        panelVisible = visible
+        apply()
+        if visible { sampleSoon(after: 0.7) }   // second sample quickly, so rates and the process list fill in
+    }
+
+    /// Called by the settings tab while it is on screen; it previews live readings.
+    func settingsVisibilityChanged(_ visible: Bool) {
+        guard settingsVisible != visible else { return }
+        settingsVisible = visible
+        if visible { notifier.refresh() }
+        apply()
+        if visible { sampleSoon(after: 0.7) }
+    }
+
+    /// Toggles a block between compact and detailed (the chevron in the panel).
+    func toggleDetail(_ block: PanelBlock) {
+        if prefs.detailedBlocks.contains(block) { prefs.detailedBlocks.remove(block) } else { prefs.detailedBlocks.insert(block) }
+    }
+
+    // MARK: Sampling
+
+    private func schedule() {
+        timer?.cancel()
+        let interval = prefs.interval
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        // Generous leeway lets the system batch the wake-up with others.
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(Int(interval * 100)))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.resume()
+        self.timer = timer
+    }
+
+    /// Pushes the current needs and preferences to the queue and samples once, so a change
+    /// in what is visible shows up immediately rather than at the next tick.
+    private func apply(running: Bool? = nil) {
+        let needs = MonitorNeeds.make(prefs: prefs, panelVisible: panelVisible, settingsVisible: settingsVisible)
+        let prefs = prefs
+        let isRunning = running ?? (timer != nil)
         queue.async { [weak self] in
-            self?.detailWanted = visible
-            if visible { self?.sampleOnQueue() }
+            guard let self else { return }
+            self.queueNeeds = needs
+            self.queuePrefs = prefs
+            self.queueRunning = isRunning
+            if isRunning { self.tick() }
         }
     }
 
-    // Accessed only on `queue`.
-    nonisolated(unsafe) private var detailWanted = false
-    nonisolated(unsafe) private var slowTick = 0
+    private func sampleSoon(after delay: TimeInterval) {
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.tick() }
+    }
 
-    /// Runs on `queue`. Cheap counters every tick; the expensive readings
-    /// (ps, sensors, battery registry) only while the panel is open.
-    nonisolated private func sampleOnQueue() {
-        let cpu = cpuSampler.sample()
-        let memory = MemoryUsage.read()
-        let net = networkSampler.sample()
-        let detail = detailWanted
-        slowTick += 1
-        let slow = slowTick % 15 == 1
-        let processes = detail ? ProcessLoad.top(5) : nil
-        let sensors = detail ? Sensors.read() : nil
-        let battery = (detail || slow) ? BatteryInfo.read() : nil
-        let disk = (detail || slow) ? DiskUsage.read() : nil
+    /// Runs on `queue`.
+    nonisolated private func tick() {
+        guard queueRunning else { return }
+        let needs = queueNeeds, prefs = queuePrefs
+        let events = sampler.sample(needs, thresholds: prefs.threshold, fahrenheit: prefs.fahrenheit)
+        let snapshot = sampler.snapshot
+        let pieces = StatusComposer.pieces(prefs: prefs, snapshot: snapshot)
+        let piecesChanged = pieces != queuePieces
+        queuePieces = pieces
+        // Nothing to show and nothing to say: stay off the main thread.
+        guard needs.visible || piecesChanged || !events.isEmpty else { return }
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.timer != nil else { return }
-                self.cpu = cpu.total
-                self.cores = cpu.cores
-                self.cpuHistory = Array((self.cpuHistory + [cpu.total]).suffix(Self.historyLength))
-                self.memory = memory
-                self.down = net.down
-                self.up = net.up
-                if let processes { self.topProcesses = processes }
-                if let sensors { self.sensors = sensors }
-                if detail || slow { self.battery = battery }
-                if let disk { self.disk = disk }
+                if needs.visible { self.snapshot = snapshot }
+                if piecesChanged { self.status.show(pieces) }
+                for event in events { self.notifier.post(event) }
             }
         }
     }
-
-    func statusText(_ style: StatusStyle) -> String? {
-        switch style {
-        case .icon: nil
-        case .cpu: Format.percent(cpu)
-        case .cpuMemory: "\(Format.percent(cpu)) · \(Format.percent(memory.fraction))"
-        case .network: "↓\(Format.rate(down)) ↑\(Format.rate(up))"
-        }
-    }
-}
-
-enum MonitorChecks {
-    static let all: [SelfTest.Check] = [
-        ("monitor: cpu usage is a sane fraction", {
-            let sampler = CPUSampler()
-            _ = sampler.sample()
-            Thread.sleep(forTimeInterval: 0.5)
-            let result = sampler.sample()
-            guard result.cores.count == ProcessInfo.processInfo.processorCount else {
-                return "got \(result.cores.count) cores, expected \(ProcessInfo.processInfo.processorCount)"
-            }
-            guard result.total > 0, result.total <= 1 else { return "total \(result.total)" }
-            return nil
-        }),
-        ("monitor: memory used is within physical memory", {
-            let memory = MemoryUsage.read()
-            guard memory.used > 1 << 30, memory.used <= memory.total else { return "used \(memory.used) of \(memory.total)" }
-            return nil
-        }),
-        ("monitor: network counters are non-zero and monotonic", {
-            let first = NetworkSampler.totals()
-            Thread.sleep(forTimeInterval: 0.3)
-            let second = NetworkSampler.totals()
-            guard first.rx > 0, second.rx >= first.rx, second.tx >= first.tx else { return "\(first) then \(second)" }
-            return nil
-        }),
-        ("monitor: disk capacity reads", {
-            let disk = DiskUsage.read()
-            guard disk.total > 0, disk.available > 0, disk.available < disk.total else { return "\(disk)" }
-            return nil
-        }),
-        ("monitor: battery reads on this laptop", {
-            guard let battery = BatteryInfo.read() else { return "no battery found" }
-            guard (0...100).contains(battery.percent), battery.cycleCount > 0 else { return "\(battery)" }
-            guard let health = battery.health, (0.3...1.2).contains(health) else { return "health \(String(describing: battery.health))" }
-            return nil
-        }),
-        ("monitor: ps output parses", {
-            let parsed = ProcessLoad.parse("  501  12.5 Google Chrome Helper\n    1   0.0 launchd\n", limit: 5)
-            guard parsed.count == 2, parsed[0].name == "Google Chrome Helper", parsed[0].cpu == 12.5 else { return "\(parsed)" }
-            guard !ProcessLoad.top(3).isEmpty else { return "live ps returned nothing" }
-            return nil
-        }),
-        ("monitor: rate formatting", {
-            let got = [Format.rate(0), Format.rate(12_300), Format.rate(3_500_000), Format.rate(250_000_000)]
-            return got == ["0 K", "12 K", "3.3 M", "238 M"] ? nil : "\(got)"
-        }),
-    ]
 }

@@ -11,6 +11,8 @@ import IOKit
 enum DDC {
     enum VCP {
         static let brightness: UInt8 = 0x10
+        static let contrast: UInt8 = 0x12
+        static let inputSource: UInt8 = 0x60
         static let volume: UInt8 = 0x62
         static let mute: UInt8 = 0x8D
     }

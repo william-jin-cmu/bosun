@@ -1,56 +1,177 @@
 import Foundation
 import Darwin
+import IOKit
 
-/// Raw samplers. Each keeps the previous counters so `sample()` returns a rate.
+// Raw CPU / memory / load readers. Sources follow the Stats app
+// (github.com/exelban/stats, MIT): host_processor_info for per-core ticks,
+// host_statistics64 for the VM counters, sysctl for swap / pressure / load.
+
+struct CPULoad {
+    var total: Double = 0          // 0...1 across all cores
+    var user: Double = 0           // 0...1, user + nice
+    var system: Double = 0         // 0...1
+    var cores: [Double] = []       // 0...1 per logical CPU, in kernel order
+    var idle: Double { max(0, 1 - user - system) }
+}
+
+/// Keeps the previous tick counters so `sample()` returns usage since the last call.
 final class CPUSampler {
-    private var previous: [(busy: UInt64, total: UInt64)] = []
+    private var previous: [(user: UInt32, system: UInt32, idle: UInt32)] = []
 
-    /// Returns overall usage 0...1 and per-core usage 0...1.
-    func sample() -> (total: Double, cores: [Double]) {
+    func sample() -> CPULoad {
         var count: natural_t = 0
         var info: processor_info_array_t?
         var infoCount: mach_msg_type_number_t = 0
         guard host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &count, &info, &infoCount) == KERN_SUCCESS,
-              let info else { return (0, []) }
+              let info else { return CPULoad() }
         defer {
             vm_deallocate(mach_task_self_, vm_address_t(bitPattern: info),
                           vm_size_t(infoCount) * vm_size_t(MemoryLayout<integer_t>.stride))
         }
-        var current: [(busy: UInt64, total: UInt64)] = []
+        var current: [(user: UInt32, system: UInt32, idle: UInt32)] = []
+        current.reserveCapacity(Int(count))
         for core in 0..<Int(count) {
             let base = core * Int(CPU_STATE_MAX)
-            let user = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_USER)]))
-            let system = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_SYSTEM)]))
-            let nice = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_NICE)]))
-            let idle = UInt64(UInt32(bitPattern: info[base + Int(CPU_STATE_IDLE)]))
-            current.append((user + system + nice, user + system + nice + idle))
+            let user = UInt32(bitPattern: info[base + Int(CPU_STATE_USER)]) &+ UInt32(bitPattern: info[base + Int(CPU_STATE_NICE)])
+            current.append((user, UInt32(bitPattern: info[base + Int(CPU_STATE_SYSTEM)]),
+                            UInt32(bitPattern: info[base + Int(CPU_STATE_IDLE)])))
         }
         defer { previous = current }
-        guard previous.count == current.count else { return (0, Array(repeating: 0, count: current.count)) }
-        var cores: [Double] = []
-        var busySum: UInt64 = 0, totalSum: UInt64 = 0
+        guard previous.count == current.count else {
+            return CPULoad(cores: Array(repeating: 0, count: current.count))
+        }
+        var load = CPULoad()
+        var userSum: UInt64 = 0, systemSum: UInt64 = 0, totalSum: UInt64 = 0
         for (now, before) in zip(current, previous) {
             // Tick counters are 32-bit and wrap; wrapping subtraction keeps deltas right.
-            let busy = UInt64(UInt32(truncatingIfNeeded: now.busy) &- UInt32(truncatingIfNeeded: before.busy))
-            let total = UInt64(UInt32(truncatingIfNeeded: now.total) &- UInt32(truncatingIfNeeded: before.total))
-            cores.append(total == 0 ? 0 : min(1, Double(busy) / Double(total)))
-            busySum += busy
+            let user = UInt64(now.user &- before.user)
+            let system = UInt64(now.system &- before.system)
+            let total = user + system + UInt64(now.idle &- before.idle)
+            load.cores.append(total == 0 ? 0 : min(1, Double(user + system) / Double(total)))
+            userSum += user
+            systemSum += system
             totalSum += total
         }
-        return (totalSum == 0 ? 0 : min(1, Double(busySum) / Double(totalSum)), cores)
+        if totalSum > 0 {
+            load.user = Double(userSum) / Double(totalSum)
+            load.system = Double(systemSum) / Double(totalSum)
+            load.total = min(1, load.user + load.system)
+        }
+        return load
     }
 }
 
+/// Which logical CPUs are efficiency cores and which are performance cores.
+struct CPUTopology {
+    struct Cluster: Equatable {
+        var name: String         // "Efficiency", "Performance", or "Cores"
+        var prefix: String       // "E", "P", or ""
+        var indices: [Int]       // logical CPU numbers, matching CPULoad.cores
+    }
+    var clusters: [Cluster]
+
+    func labels() -> [String] {
+        var out: [Int: String] = [:]
+        for cluster in clusters {
+            for (n, index) in cluster.indices.enumerated() { out[index] = "\(cluster.prefix)\(n + 1)" }
+        }
+        return out.keys.sorted().map { out[$0]! }
+    }
+
+    /// Mean load of one cluster.
+    static func mean(_ cores: [Double], _ cluster: Cluster) -> Double {
+        let values = cluster.indices.compactMap { $0 < cores.count ? cores[$0] : nil }
+        return values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+    }
+
+    /// Builds clusters from one type letter per logical CPU ("E" / "P"); efficiency first.
+    static func make(types: [Character]) -> CPUTopology {
+        let efficiency = types.indices.filter { types[$0] == "E" }
+        let performance = types.indices.filter { types[$0] == "P" }
+        guard !efficiency.isEmpty, efficiency.count + performance.count == types.count else {
+            return CPUTopology(clusters: [Cluster(name: "Cores", prefix: "", indices: Array(types.indices))])
+        }
+        var clusters = [Cluster(name: "Efficiency", prefix: "E", indices: efficiency)]
+        if !performance.isEmpty { clusters.append(Cluster(name: "Performance", prefix: "P", indices: performance)) }
+        return CPUTopology(clusters: clusters)
+    }
+
+    /// Read once: the `cluster-type` property of each IODeviceTree:/cpus child (what Stats
+    /// uses); falls back to the hw.perflevel sysctls assuming efficiency cores come first.
+    static let current: CPUTopology = {
+        let count = ProcessInfo.processInfo.processorCount
+        var types = [Character](repeating: "?", count: count)
+        let cpus = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/cpus")
+        if cpus != 0 {
+            defer { IOObjectRelease(cpus) }
+            var iterator: io_iterator_t = 0
+            if IORegistryEntryGetChildIterator(cpus, "IODeviceTree", &iterator) == KERN_SUCCESS {
+                defer { IOObjectRelease(iterator) }
+                while case let child = IOIteratorNext(iterator), child != 0 {
+                    defer { IOObjectRelease(child) }
+                    func data(_ key: String) -> Data? {
+                        IORegistryEntryCreateCFProperty(child, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Data
+                    }
+                    guard let type = data("cluster-type")?.first, let idData = data("logical-cpu-id") ?? data("cpu-id"),
+                          let id = idData.first.map(Int.init), id < count else { continue }
+                    types[id] = Character(UnicodeScalar(type))
+                }
+            }
+        }
+        if types.contains("?") {
+            let performance = sysctlInt("hw.perflevel0.logicalcpu"), efficiency = sysctlInt("hw.perflevel1.logicalcpu")
+            if sysctlInt("hw.nperflevels") == 2, performance + efficiency == count {
+                types = Array(repeating: "E", count: efficiency) + Array(repeating: "P", count: performance)
+            }
+        }
+        return make(types: types)
+    }()
+
+    static let chipName: String = sysctlString("machdep.cpu.brand_string")
+}
+
+func sysctlInt(_ name: String) -> Int {
+    var value: Int64 = 0
+    var size = MemoryLayout<Int64>.size
+    return sysctlbyname(name, &value, &size, nil, 0) == 0 ? Int(value) : 0
+}
+
+func sysctlString(_ name: String) -> String {
+    var size = 0
+    guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "" }
+    var buffer = [CChar](repeating: 0, count: size)
+    guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return "" }
+    return String(cString: buffer)
+}
+
 struct MemoryUsage {
-    var used: UInt64 = 0
+    enum Pressure: Int, Comparable {
+        case normal = 1, warning = 2, critical = 4
+        static func < (a: Pressure, b: Pressure) -> Bool { a.rawValue < b.rawValue }
+        var label: String {
+            switch self {
+            case .normal: "Normal"
+            case .warning: "Warning"
+            case .critical: "Critical"
+            }
+        }
+    }
+
     var total: UInt64 = ProcessInfo.processInfo.physicalMemory
-    var compressed: UInt64 = 0
+    var app: UInt64 = 0          // anonymous memory minus purgeable
+    var wired: UInt64 = 0
+    var compressed: UInt64 = 0   // physical pages held by the compressor
+    var cached: UInt64 = 0       // file-backed + purgeable ("Cached Files" in Activity Monitor)
+    var free: UInt64 = 0
     var swapUsed: UInt64 = 0
+    var swapTotal: UInt64 = 0
+    var pressure: Pressure = .normal
+
+    /// "Memory Used" as Activity Monitor shows it: app + wired + compressed.
+    var used: UInt64 { min(total, app + wired + compressed) }
     var fraction: Double { total == 0 ? 0 : Double(used) / Double(total) }
 
-    /// "Used" follows Activity Monitor: app memory + wired + compressed.
     static func read() -> MemoryUsage {
-        var usage = MemoryUsage()
         var stats = vm_statistics64()
         var size = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.stride / MemoryLayout<integer_t>.stride)
         let result = withUnsafeMutablePointer(to: &stats) {
@@ -58,115 +179,99 @@ struct MemoryUsage {
                 host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &size)
             }
         }
-        guard result == KERN_SUCCESS else { return usage }
-        let page = UInt64(vm_kernel_page_size)
-        let app = UInt64(stats.internal_page_count) &- UInt64(stats.purgeable_count)
-        usage.compressed = UInt64(stats.compressor_page_count) * page
-        usage.used = min(usage.total, (app + UInt64(stats.wire_count)) * page + usage.compressed)
+        var usage = result == KERN_SUCCESS ? make(stats, pageSize: UInt64(vm_kernel_page_size)) : MemoryUsage()
         var swap = xsw_usage()
         var swapSize = MemoryLayout<xsw_usage>.stride
-        if sysctlbyname("vm.swapusage", &swap, &swapSize, nil, 0) == 0 { usage.swapUsed = swap.xsu_used }
+        if sysctlbyname("vm.swapusage", &swap, &swapSize, nil, 0) == 0 {
+            usage.swapUsed = swap.xsu_used
+            usage.swapTotal = swap.xsu_total
+        }
+        var level: Int32 = 0
+        var levelSize = MemoryLayout<Int32>.size
+        if sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &levelSize, nil, 0) == 0 {
+            usage.pressure = Pressure(rawValue: Int(level)) ?? .normal
+        }
+        return usage
+    }
+
+    static func make(_ stats: vm_statistics64, pageSize page: UInt64,
+                     total: UInt64 = ProcessInfo.processInfo.physicalMemory) -> MemoryUsage {
+        var usage = MemoryUsage(total: total)
+        let purgeable = UInt64(stats.purgeable_count)
+        let anonymous = UInt64(stats.internal_page_count)
+        usage.app = (anonymous > purgeable ? anonymous - purgeable : 0) * page
+        usage.wired = UInt64(stats.wire_count) * page
+        usage.compressed = UInt64(stats.compressor_page_count) * page
+        usage.cached = (UInt64(stats.external_page_count) + purgeable) * page
+        let speculative = UInt64(stats.speculative_count), free = UInt64(stats.free_count)
+        usage.free = (free > speculative ? free - speculative : 0) * page
         return usage
     }
 }
 
-final class NetworkSampler {
-    private var previous: (rx: UInt64, tx: UInt64, at: TimeInterval)?
+struct SystemLoad {
+    var one: Double = 0, five: Double = 0, fifteen: Double = 0
+    var bootTime: Date?
 
-    /// Bytes per second across physical interfaces (en*), 0 on the first call.
-    func sample() -> (down: Double, up: Double) {
-        let (rx, tx) = Self.totals()
-        let now = ProcessInfo.processInfo.systemUptime
-        defer { previous = (rx, tx, now) }
-        guard let previous, now > previous.at, rx >= previous.rx, tx >= previous.tx else { return (0, 0) }
-        let dt = now - previous.at
-        return (Double(rx - previous.rx) / dt, Double(tx - previous.tx) / dt)
+    static func read() -> SystemLoad {
+        var averages = [Double](repeating: 0, count: 3)
+        var load = SystemLoad()
+        if getloadavg(&averages, 3) == 3 { (load.one, load.five, load.fifteen) = (averages[0], averages[1], averages[2]) }
+        load.bootTime = boot
+        return load
     }
 
-    /// 64-bit per-interface counters via the routing sysctl (getifaddrs only exposes 32-bit ones).
-    static func totals() -> (rx: UInt64, tx: UInt64) {
-        var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
-        var length = 0
-        guard sysctl(&mib, UInt32(mib.count), nil, &length, nil, 0) == 0, length > 0 else { return (0, 0) }
-        var buffer = [UInt8](repeating: 0, count: length)
-        guard sysctl(&mib, UInt32(mib.count), &buffer, &length, nil, 0) == 0 else { return (0, 0) }
-        var rx: UInt64 = 0, tx: UInt64 = 0
-        var offset = 0
-        buffer.withUnsafeBytes { raw in
-            while offset + MemoryLayout<if_msghdr>.size <= length {
-                let header = raw.loadUnaligned(fromByteOffset: offset, as: if_msghdr.self)
-                guard header.ifm_msglen > 0 else { break }
-                if Int32(header.ifm_type) == RTM_IFINFO2, offset + MemoryLayout<if_msghdr2>.size <= length {
-                    let info = raw.loadUnaligned(fromByteOffset: offset, as: if_msghdr2.self)
-                    var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
-                    if if_indextoname(UInt32(info.ifm_index), &name) != nil, String(cString: name).hasPrefix("en") {
-                        rx += info.ifm_data.ifi_ibytes
-                        tx += info.ifm_data.ifi_obytes
-                    }
-                }
-                offset += Int(header.ifm_msglen)
-            }
-        }
-        return (rx, tx)
-    }
-}
-
-struct DiskUsage {
-    var available: Int64 = 0
-    var total: Int64 = 0
-    static func read() -> DiskUsage {
-        let url = URL(fileURLWithPath: NSHomeDirectory())
-        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
-        return DiskUsage(available: values?.volumeAvailableCapacityForImportantUsage ?? 0,
-                         total: Int64(values?.volumeTotalCapacity ?? 0))
-    }
-}
-
-struct ProcessLoad: Identifiable {
-    let pid: Int32
-    let name: String
-    let cpu: Double      // percent of one core, as ps reports it
-    var id: Int32 { pid }
-
-    /// Top CPU consumers. Shells out to ps, so only call while the panel is open.
-    static func top(_ limit: Int) -> [ProcessLoad] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-Aceo", "pid=,pcpu=,comm=", "-r"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return parse(String(decoding: data, as: UTF8.self), limit: limit)
-    }
-
-    static func parse(_ output: String, limit: Int) -> [ProcessLoad] {
-        var result: [ProcessLoad] = []
-        for line in output.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-            guard parts.count == 3, let pid = Int32(parts[0]), let cpu = Double(parts[1]) else { continue }
-            result.append(ProcessLoad(pid: pid, name: String(parts[2]), cpu: cpu))
-            if result.count == limit { break }
-        }
-        return result
-    }
+    static let boot: Date? = {
+        var time = timeval()
+        var size = MemoryLayout<timeval>.stride
+        guard sysctlbyname("kern.boottime", &time, &size, nil, 0) == 0, time.tv_sec > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(time.tv_sec) + Double(time.tv_usec) / 1e6)
+    }()
 }
 
 enum Format {
-    static func bytes(_ value: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: value, countStyle: .memory)
+    static func bytes(_ value: Int64) -> String { byteCount(value, .memory) }
+    static func bytes(_ value: UInt64) -> String { bytes(Int64(clamping: value)) }
+    static func disk(_ value: Int64) -> String { byteCount(value, .file) }
+    /// A formatter per call: ByteCountFormatter is not documented as thread-safe and this is
+    /// used from both the main thread and the sampling queue. "0 KB" rather than "Zero KB".
+    private static func byteCount(_ value: Int64, _ style: ByteCountFormatter.CountStyle) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = style
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: value)
     }
-    static func disk(_ value: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
-    }
-    /// Compact transfer rate: "0 K", "12 K", "3.4 M".
+    /// Compact transfer rate without the unit suffix: "0 K", "12 K", "3.4 M", "1.2 G".
     static func rate(_ bytesPerSecond: Double) -> String {
-        let kb = bytesPerSecond / 1024
+        let kb = max(0, bytesPerSecond) / 1024
         if kb < 1000 { return "\(Int(kb.rounded())) K" }
         let mb = kb / 1024
-        return mb < 100 ? String(format: "%.1f M", mb) : "\(Int(mb.rounded())) M"
+        if mb < 100 { return String(format: "%.1f M", mb) }
+        if mb < 1000 { return "\(Int(mb.rounded())) M" }
+        return String(format: "%.1f G", mb / 1024)
     }
+    /// "12 KB/s"
+    static func speed(_ bytesPerSecond: Double) -> String { rate(bytesPerSecond) + "B/s" }
     static func percent(_ fraction: Double) -> String { "\(Int((fraction * 100).rounded()))%" }
+
+    /// "48 °C" / "118 °F".
+    static func temperature(_ celsius: Double, fahrenheit: Bool, digits: Int = 0) -> String {
+        let value = fahrenheit ? celsius * 9 / 5 + 32 : celsius
+        return String(format: "%.\(digits)f °%@", value, fahrenheit ? "F" : "C")
+    }
+    /// "48°" for the menu bar.
+    static func degrees(_ celsius: Double, fahrenheit: Bool) -> String {
+        "\(Int((fahrenheit ? celsius * 9 / 5 + 32 : celsius).rounded()))°"
+    }
+
+    /// "45 s", "12 min", "3 h 05 min", "16 d 4 h".
+    static func duration(_ seconds: TimeInterval) -> String {
+        let total = Int(max(0, seconds))
+        if total < 60 { return "\(total) s" }
+        let minutes = total / 60
+        if minutes < 60 { return "\(minutes) min" }
+        let hours = minutes / 60
+        if hours < 24 { return String(format: "%d h %02d min", hours, minutes % 60) }
+        return "\(hours / 24) d \(hours % 24) h"
+    }
 }
