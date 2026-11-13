@@ -2,7 +2,6 @@ import SwiftUI
 
 struct PanelView: View {
     @ObservedObject var state: AppState
-    @AppStorage("status.style") private var style: StatusStyle = .icon
     @State private var contentHeight: CGFloat = 400
     /// Set by the off-screen snapshot, which wants the whole panel unclipped.
     var unboundedHeight = false
@@ -27,15 +26,8 @@ struct PanelView: View {
             .frame(height: min(contentHeight, maxListHeight))
             Divider()
             HStack(spacing: 12) {
-                Picker("Menu bar shows", selection: $style) {
-                    ForEach(StatusStyle.allCases) { Text($0.label).tag($0) }
-                }
-                .labelsHidden().fixedSize()
-                .help("What the menu bar item shows")
+                Button("Settings…") { SettingsWindow.show() }
                 Spacer()
-                Toggle("Open at login", isOn: Binding(
-                    get: { state.launchAtLogin }, set: { state.setLaunchAtLogin($0) }))
-                    .toggleStyle(.checkbox).fixedSize()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
             .font(.callout)
@@ -59,6 +51,11 @@ struct ModuleCard<Content: View>: View {
             HStack {
                 Label(module.title, systemImage: module.symbol).font(.headline)
                 Spacer()
+                Button { SettingsWindow.show(SettingsTab(rawValue: module.id == "monitor" ? "system" : module.id == "audio" ? "sound" : module.id)) } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.borderless).foregroundStyle(.secondary)
+                .help("\(module.title) settings").accessibilityLabel("\(module.title) settings")
                 Toggle("", isOn: Binding(get: { on }, set: { state.setEnabled(module, $0) }))
                     .toggleStyle(.switch).controlSize(.mini).labelsHidden()
                     .accessibilityLabel("\(module.title) enabled")

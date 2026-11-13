@@ -27,7 +27,7 @@ final class AppState: ObservableObject {
         // Start after init returns, so nothing a module does while starting can
         // reach back into a half-built AppState.shared.
         DispatchQueue.main.async { [self] in
-            for module in modules where isEnabled(module) { module.start() }
+            for module in modules where isEnabled(module) && Self.mayStart(module) { module.start() }
             started = true
             if panelVisible { panelVisibilityChanged(true) }
         }
@@ -37,6 +37,20 @@ final class AppState: ObservableObject {
             MainActor.assumeIsolated { self?.stopAll() }
         }
     }
+
+    /// Snapshot runs (`--snapshot`) share the machine with the installed app, so
+    /// by default they only start modules that just read state. `--start a,b,c`
+    /// (module ids, or `none`) overrides the list.
+    static let snapshotMode = CommandLine.arguments.contains("--snapshot")
+    private static func mayStart(_ module: any BosunModule) -> Bool {
+        guard snapshotMode else { return true }
+        var allowed = ["monitor", "displays", "audio"]
+        if let index = CommandLine.arguments.firstIndex(of: "--start"), CommandLine.arguments.count > index + 1 {
+            allowed = CommandLine.arguments[index + 1].split(separator: ",").map(String.init)
+        }
+        return allowed.contains(module.id)
+    }
+    private var running: Set<String> = []
 
     func isEnabled(_ module: any BosunModule) -> Bool { enabled[module.id] ?? false }
 

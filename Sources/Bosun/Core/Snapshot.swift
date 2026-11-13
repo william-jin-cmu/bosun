@@ -7,10 +7,26 @@ enum Snapshot {
     static func run(path: String, settle: TimeInterval = 9) {
         let state = AppState.shared
         state.panelVisibilityChanged(true)
-        let host = NSHostingView(rootView: PanelView(state: state, unboundedHeight: true)
-            .frame(height: 1400, alignment: .top)
-            .background(Color(nsColor: .windowBackgroundColor)))
-        let window = NSWindow(contentRect: NSRect(x: -5000, y: -5000, width: 360, height: 1400),
+        // `--settings <tab>` renders that settings tab instead of the panel.
+        var settingsTab: SettingsTab?
+        if let index = CommandLine.arguments.firstIndex(of: "--settings"), CommandLine.arguments.count > index + 1 {
+            settingsTab = SettingsTab(rawValue: CommandLine.arguments[index + 1])
+        }
+        let size = settingsTab == nil ? NSSize(width: 360, height: 1400) : NSSize(width: 760, height: 900)
+        let root: AnyView
+        if let settingsTab {
+            let selection = SettingsSelection()
+            selection.tab = settingsTab
+            root = AnyView(SettingsView(state: state, selection: selection)
+                .frame(width: size.width, height: size.height)
+                .background(Color(nsColor: .windowBackgroundColor)))
+        } else {
+            root = AnyView(PanelView(state: state, unboundedHeight: true)
+                .frame(height: size.height, alignment: .top)
+                .background(Color(nsColor: .windowBackgroundColor)))
+        }
+        let host = NSHostingView(rootView: root)
+        let window = NSWindow(contentRect: NSRect(origin: NSPoint(x: -5000, y: -5000), size: size),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = host
         window.orderBack(nil)

@@ -12,6 +12,8 @@
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocationUsageDescription</key><string>Bosun uses your location to work out sunrise and sunset for the color temperature schedule.</string>
+    <key>NSLocationWhenInUseUsageDescription</key><string>Bosun uses your location to work out sunrise and sunset for the color temperature schedule.</string>
     <key>NSAudioCaptureUsageDescription</key><string>Bosun reads the audio of individual apps so it can change their volume.</string>
 </dict>
 </plist>
