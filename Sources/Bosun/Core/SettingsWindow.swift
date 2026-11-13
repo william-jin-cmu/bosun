@@ -103,17 +103,6 @@ struct SettingsView: View {
     }
 }
 
-struct GeneralSettings: View {
-    @ObservedObject var state: AppState
-    var body: some View {
-        Form {
-            Toggle("Open Bosun at login", isOn: Binding(
-                get: { state.launchAtLogin }, set: { state.setLaunchAtLogin($0) }))
-            LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")
-        }
-    }
-}
-
 /// Shared Accessibility-permission helper (event taps need it).
 enum Accessibility {
     static var isTrusted: Bool { AXIsProcessTrusted() }
