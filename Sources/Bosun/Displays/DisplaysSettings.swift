@@ -299,6 +299,9 @@ private struct AutomationGroup: View {
             Divider()
             Toggle("Restore brightness and contrast on launch, wake and reconnect", isOn: module.binding(\.restore))
             Note("Off: Bosun shows whatever the display reports. On: Bosun writes back the last values it knew, for displays that forget their settings or come back from sleep changed.")
+            Divider()
+            Toggle("Reconnect disconnected displays when Bosun quits", isOn: module.binding(\.reconnectOnQuit))
+            Note("Also when Displays is turned off, and at the next launch after a crash. Logging out or restarting always reconnects them.")
         }
     }
 }
@@ -319,6 +322,12 @@ private struct DisplaysGroup: View {
             ForEach(module.displays) { display in
                 DisplayCard(module: module, display: display, prefs: module.config.prefs(display.key))
             }
+            ForEach(module.disconnected) { display in
+                SettingsGroup(title: display.name) {
+                    DisconnectedRow(module: module, display: display)
+                    Note("Plugged in but taken out of the arrangement: macOS does not draw to it, and power and USB over the cable keep working.")
+                }
+            }
         }
     }
 }
@@ -337,6 +346,20 @@ private struct DisplayCard: View {
                     .toggleStyle(.switch).controlSize(.mini).controlSize(.small)
             }
             .foregroundStyle(.secondary)
+
+            if DisplayEnabler.isAvailable {
+                Row(label: "Disconnect without unplugging") {
+                    Button("Disconnect") { module.disconnect(display.id) }
+                        .controlSize(.small)
+                        .disabled(!module.canDisconnect(display.id))
+                        .accessibilityLabel("Disconnect \(display.name)")
+                }
+                Note(module.canDisconnect(display.id)
+                    ? (display.isBuiltIn
+                        ? "macOS stops drawing to the built-in screen and moves its windows to the other displays, as with the lid closed."
+                        : "macOS stops drawing to this display and moves its windows to the other screens, as if it were unplugged. Charging, USB and audio through the same cable keep working.")
+                    : "This is the only active display, so it cannot be disconnected.")
+            }
 
             if prefs.enabled {
                 Row(label: "Name") {

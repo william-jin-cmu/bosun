@@ -5,16 +5,56 @@ struct DisplaysSection: View {
 
     var body: some View {
         let visible = module.displays.filter { module.config.prefs($0.key).enabled }
-        if visible.isEmpty {
-            Text(module.displays.isEmpty ? "No displays found" : "All displays are turned off in Settings")
-                .foregroundStyle(.secondary).font(.callout)
-        } else {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(visible) { display in
-                    DisplayBlock(module: module, display: display, prefs: module.config.prefs(display.key))
-                }
+        VStack(alignment: .leading, spacing: 10) {
+            if visible.isEmpty {
+                Text(module.displays.isEmpty ? "No displays found" : "All displays are turned off in Settings")
+                    .foregroundStyle(.secondary).font(.callout)
+            }
+            ForEach(visible) { display in
+                DisplayBlock(module: module, display: display, prefs: module.config.prefs(display.key))
+            }
+            ForEach(module.disconnected) { display in
+                DisconnectedRow(module: module, display: display)
             }
         }
+    }
+}
+
+/// A display that is plugged in but taken out of the arrangement.
+struct DisconnectedRow: View {
+    let module: DisplaysModule
+    let display: DisconnectedDisplay
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(display.name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                Text("Disconnected").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Reconnect") { module.reconnect(display.id) }
+                .controlSize(.small)
+                .accessibilityLabel("Reconnect \(display.name)")
+        }
+    }
+}
+
+/// Takes the display out of the arrangement. The cable, and any charging
+/// through it, stays as it is.
+struct DisconnectButton: View {
+    let module: DisplaysModule
+    let display: DisplayState
+
+    var body: some View {
+        Button {
+            module.disconnect(display.id)
+        } label: {
+            Image(systemName: "eject")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Disconnect \(display.name). The cable stays in and keeps charging; Reconnect brings it back.")
+        .accessibilityLabel("Disconnect \(display.name)")
     }
 }
 
@@ -31,6 +71,9 @@ private struct DisplayBlock: View {
                 if prefs.showInput, let input = display.input {
                     InputMenu(module: module, display: display, input: input)
                         .controlSize(.small).fixedSize()
+                }
+                if module.canDisconnect(display.id) {
+                    DisconnectButton(module: module, display: display)
                 }
             }
             if display.control == .none {

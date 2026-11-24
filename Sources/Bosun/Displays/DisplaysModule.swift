@@ -159,6 +159,8 @@ final class DisplaysModule: ObservableObject, BosunModule {
     /// Custom shortcuts the system refused to register.
     @Published private(set) var shortcutFailures: Set<DisplayKeyAction> = []
     @Published private(set) var isRunning = false
+    /// Displays Bosun took out of the arrangement; the cable is still in.
+    @Published private(set) var disconnected: [DisconnectedDisplay] = DisplayDisconnectLogic.load()
 
     private let worker = DDCWorker()
     private let keyTap = DisplayKeyTap()
@@ -218,6 +220,12 @@ final class DisplaysModule: ObservableObject, BosunModule {
         soundWatcher.start()
         soundOutput = SoundOutputWatcher.current()
 
+        // Left over from a run that ended without reconnecting (crash, kill).
+        if sideEffectsAllowed {
+            setDisconnected(DisplayDisconnectLogic.prune(disconnected, active: Self.activeDisplayIDs()))
+            if config.reconnectOnQuit { reconnectAll() }
+        }
+
         refresh()
         updateSyncTimer()
         updateKeyHandling()
@@ -244,6 +252,7 @@ final class DisplaysModule: ObservableObject, BosunModule {
         services = [:]
         worker.forget()
         displays = []
+        if sideEffectsAllowed, config.reconnectOnQuit { reconnectAll() }
         saveNow()
     }
 
@@ -270,6 +279,7 @@ final class DisplaysModule: ObservableObject, BosunModule {
     }
 
     private func screensChanged() {
+        setDisconnected(DisplayDisconnectLogic.prune(disconnected, active: Self.activeDisplayIDs()))
         shades.screensChanged()
         refresh()
     }
@@ -435,6 +445,8 @@ final class DisplaysModule: ObservableObject, BosunModule {
         }
 
         if fresh != displays { displays = fresh }
+        setDisconnected(DisplayDisconnectLogic.prune(disconnected, active: fresh.map(\.id),
+                                                     activeKeys: Set(fresh.map(\.key))))
         for state in fresh where state.control != .none {
             seenKeys.insert(state.key)
             // Remember what the display holds, for restore and for the
@@ -771,6 +783,53 @@ final class DisplaysModule: ObservableObject, BosunModule {
         }
         for displayID in shades.dimmedDisplays where wanted[displayID] == nil { shades.remove(displayID) }
         for (displayID, opacity) in wanted { shades.setOpacity(opacity, for: displayID) }
+    }
+
+    // MARK: Disconnect
+
+    func canDisconnect(_ displayID: CGDirectDisplayID) -> Bool {
+        DisplayEnabler.isAvailable && DisplayDisconnectLogic.canDisconnect(displayID, active: Self.activeDisplayIDs())
+    }
+
+    /// Takes a display out of the arrangement without unplugging it.
+    func disconnect(_ displayID: CGDirectDisplayID) {
+        guard sideEffectsAllowed, canDisconnect(displayID),
+              let display = displays.first(where: { $0.id == displayID }) else { return }
+        shades.remove(displayID)
+        guard DisplayEnabler.set(displayID, enabled: false) else {
+            Log.info("could not disconnect display \(displayID)", "displays")
+            return
+        }
+        Log.info("disconnected display \(displayID) (\(display.systemName))", "displays")
+        let entry = DisconnectedDisplay(id: displayID, key: display.key, name: display.name,
+                                        isBuiltIn: display.isBuiltIn, since: Date())
+        setDisconnected(DisplayDisconnectLogic.adding(entry, to: disconnected))
+        refresh()
+    }
+
+    func reconnect(_ displayID: CGDirectDisplayID) {
+        guard sideEffectsAllowed, disconnected.contains(where: { $0.id == displayID }) else { return }
+        if DisplayEnabler.set(displayID, enabled: true) {
+            Log.info("reconnected display \(displayID)", "displays")
+            setDisconnected(disconnected.filter { $0.id != displayID })
+        } else if !DisplayEnabler.onlineDisplayIDs().contains(displayID) {
+            // Unplugged while disconnected; it comes back by itself when plugged in.
+            Log.info("display \(displayID) is no longer attached; forgetting it", "displays")
+            setDisconnected(disconnected.filter { $0.id != displayID })
+        } else {
+            Log.info("could not reconnect display \(displayID)", "displays")
+        }
+        refresh()
+    }
+
+    func reconnectAll() {
+        for display in disconnected { reconnect(display.id) }
+    }
+
+    private func setDisconnected(_ list: [DisconnectedDisplay]) {
+        guard list != disconnected else { return }
+        disconnected = list
+        DisplayDisconnectLogic.save(list)
     }
 
     // MARK: Keys

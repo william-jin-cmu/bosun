@@ -15,6 +15,8 @@ enum DisplaysChecks {
         (name: "displays: volume key takeover", run: volumeTakeover),
         (name: "displays: settings storage", run: settingsStorage),
         (name: "displays: readings to state", run: readingsToState),
+        (name: "displays: disconnect rules and storage", run: disconnectRules),
+        (name: "displays: disconnect API present", run: disconnectAPI),
         (name: "displays: enumerate", run: enumerate),
         (name: "displays: built-in brightness read", run: builtInBrightness),
         (name: "displays: DDC brightness write, read back, restore", run: ddcRoundTrip),
@@ -42,6 +44,40 @@ enum DisplaysChecks {
         corrupt[9] ^= 0xFF
         if DDC.parseReply(corrupt, vcp: 0x10) != nil { return "reply with a bad checksum was accepted" }
         return nil
+    }
+
+    private static func disconnectRules() -> String? {
+        if DisplayDisconnectLogic.canDisconnect(1, active: [1]) { return "allowed disconnecting the only display" }
+        if !DisplayDisconnectLogic.canDisconnect(3, active: [1, 3]) { return "refused disconnecting one of two displays" }
+        if DisplayDisconnectLogic.canDisconnect(5, active: [1, 3]) { return "allowed disconnecting an inactive display" }
+        let a = DisconnectedDisplay(id: 3, key: "k3", name: "A", isBuiltIn: false, since: Date(timeIntervalSince1970: 1))
+        let b = DisconnectedDisplay(id: 4, key: "k4", name: "B", isBuiltIn: false, since: Date(timeIntervalSince1970: 2))
+        if DisplayDisconnectLogic.prune([a, b], active: [1, 4]) != [a] { return "prune kept a display that is active again" }
+        if DisplayDisconnectLogic.prune([a, b], active: [1, 9], activeKeys: ["k4"]) != [a] {
+            return "prune kept a display that came back under a new ID"
+        }
+        let replugged = DisconnectedDisplay(id: 7, key: "k3", name: "A", isBuiltIn: false, since: Date(timeIntervalSince1970: 3))
+        if DisplayDisconnectLogic.adding(replugged, to: [a, b]) != [b, replugged] {
+            return "disconnecting a re-plugged display left its old entry"
+        }
+        if DisplayDisconnectLogic.deduplicated([a, b, replugged]) != [b, replugged] {
+            return "stored duplicates of one display were not merged"
+        }
+
+        guard let defaults = UserDefaults(suiteName: "bosun.selftest.disconnect") else { return "no scratch defaults" }
+        defer { defaults.removePersistentDomain(forName: "bosun.selftest.disconnect") }
+        DisplayDisconnectLogic.save([a, b], defaults)
+        if DisplayDisconnectLogic.load(defaults) != [a, b] { return "stored list did not load back" }
+        DisplayDisconnectLogic.save([], defaults)
+        if defaults.object(forKey: DisplayDisconnectLogic.defaultsKey) != nil { return "empty list left a stored value" }
+        if !DisplaysConfig.decode(Data("{}".utf8)).reconnectOnQuit { return "reconnect on quit is not the default" }
+        return nil
+    }
+
+    /// Only checks the private call resolves; actually disconnecting would
+    /// rearrange the user's screens.
+    private static func disconnectAPI() -> String? {
+        DisplayEnabler.isAvailable ? nil : "CGSConfigureDisplayEnabled not found"
     }
 
     private static func enumerate() -> String? {

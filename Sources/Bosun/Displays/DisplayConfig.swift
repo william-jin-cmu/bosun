@@ -80,6 +80,9 @@ struct DisplaysConfig: Codable, Equatable {
     /// Write the last known values back on launch, wake and reconnect
     /// instead of adopting whatever the display reports.
     var restore = false
+    /// Bring back displays Bosun disconnected when Bosun quits or Displays is
+    /// turned off, so a display is never left dark with nothing to undo it.
+    var reconnectOnQuit = true
 
     var displays: [String: DisplayPrefs] = [:]
 
