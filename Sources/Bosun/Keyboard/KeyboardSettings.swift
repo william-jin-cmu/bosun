@@ -25,6 +25,17 @@ struct KeyboardSettings: View {
         VStack(alignment: .leading, spacing: 14) {
             KeyboardStatus(module: module)
 
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Disable built-in keyboard when an external keyboard is connected",
+                       isOn: $module.disableBuiltInWhenExternalConnected)
+                    .toggleStyle(.switch)
+                Text(builtInStatusText)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+
             HStack {
                 Text("Rules").font(.headline)
                 Spacer()
@@ -59,6 +70,7 @@ struct KeyboardSettings: View {
 
             if let debug = Self.debugView { debugContent(debug) }
         }
+        .onAppear { module.refreshKeyboards() }
         .sheet(item: $sheet) { sheet in
             switch sheet {
             case .edit(let rule, let isNew):
@@ -69,6 +81,17 @@ struct KeyboardSettings: View {
                 ImportReport(module: module, result: result) { self.sheet = nil }
             }
         }
+    }
+
+    private var builtInStatusText: String {
+        if module.externalKeyboards.isEmpty {
+            return "No external keyboard detected. Mice with macro keys are ignored."
+        }
+        let names = module.externalKeyboards.map(\.name).joined(separator: ", ")
+        if module.builtInDisabled {
+            return "External keyboard connected: \(names) — built-in keyboard is disabled."
+        }
+        return "External keyboard connected: \(names)."
     }
 
     private func new(_ body: KeyRule.Body) {
@@ -155,6 +178,9 @@ struct KeyboardStatus: View {
         var parts = ["\(remaps) key remap\(remaps == 1 ? "" : "s") active"]
         if module.tapRunning {
             parts.append("\(tapRules) shortcut/hold rule\(tapRules == 1 ? "" : "s") active (event tap at the \(module.tapLocation?.rawValue ?? "?") level)")
+        }
+        if module.builtInDisabled {
+            parts.append("built-in keyboard disabled")
         }
         return parts.joined(separator: " · ")
     }

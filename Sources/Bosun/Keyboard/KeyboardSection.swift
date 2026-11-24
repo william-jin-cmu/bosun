@@ -25,11 +25,29 @@ struct KeyboardSection: View {
                         .toggleStyle(.switch).controlSize(.mini).labelsHidden()
                 }
             }
+            Divider()
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Disable built-in keyboard").font(.callout).lineLimit(1)
+                    Text(builtInDetail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Toggle("Disable built-in keyboard", isOn: $module.disableBuiltInWhenExternalConnected)
+                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            }
             HStack {
                 Spacer()
                 Button("Edit Rules…") { SettingsWindow.show(.keyboard) }
                     .controlSize(.small)
             }
         }
+    }
+
+    private var builtInDetail: String {
+        if module.builtInDisabled {
+            let names = module.externalKeyboards.map(\.name).joined(separator: ", ")
+            return "Active · \(names)"
+        }
+        return "When an external keyboard is connected"
     }
 }

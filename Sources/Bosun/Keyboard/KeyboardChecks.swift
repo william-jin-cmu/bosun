@@ -23,6 +23,7 @@ enum KeyboardChecks {
         ("keyboard tap: event plumbing", tapPlumbing),
         ("keyboard mapping: merge and unmerge", mergeFixtures),
         ("keyboard mapping: plans for global and per-keyboard remaps", planFixtures),
+        ("keyboard mapping: built-in keyboard disable and device classification", builtInDisableFixtures),
         ("keyboard mapping: hidutil arguments and parsing", jsonFixtures),
         ("keyboard import: the user's Karabiner config", importUserConfig),
         ("keyboard import: unsupported pieces are reported", importSkips),
@@ -1009,6 +1010,67 @@ enum KeyboardChecks {
         // Nothing to do and nothing recorded on a clean system.
         let nothing = HIDMapping.plan(current: .init(global: [], devices: [board: []]), previous: nil, desired: .init())
         if !nothing.isNoop || !nothing.applied.isEmpty { return "empty plan is not empty: \(nothing)" }
+        return nil
+    }
+
+    private static func builtInDisableFixtures() -> String? {
+        let builtIn = KeyboardDevice(vendorID: 0x5AC, productID: 0x343, name: "Apple Internal Keyboard / Trackpad")
+        let external = KeyboardDevice(vendorID: 0x320F, productID: 0x5088, name: "Wireless Gaming Keyboard")
+        let mouse = KeyboardDevice(vendorID: 0x1532, productID: 0xC5, name: "Razer DeathAdder V3 HyperSpeed")
+        let virtual = KeyboardDevice(vendorID: 0x16C0, productID: 0x27DB, name: "Karabiner VirtualHIDKeyboard")
+
+        let services: [HIDMapping.ServiceInfo] = [
+            // Built-in keyboard + built-in trackpad share VID/PID
+            .init(device: builtIn, builtIn: true, isKeyboard: true, primaryUsagePage: 1, primaryUsage: 6, transport: "SPI"),
+            .init(device: builtIn, builtIn: true, isKeyboard: false, primaryUsagePage: 1, primaryUsage: 2, transport: "SPI"),
+            // Gaming mouse exposes both a primary mouse service and keyboard macro interfaces
+            .init(device: mouse, builtIn: false, isKeyboard: false, primaryUsagePage: 1, primaryUsage: 2, transport: "USB"),
+            .init(device: mouse, builtIn: false, isKeyboard: true, primaryUsagePage: 1, primaryUsage: 6, transport: "USB"),
+            // Real external keyboard (two keyboard interfaces, no primary mouse)
+            .init(device: external, builtIn: false, isKeyboard: true, primaryUsagePage: 1, primaryUsage: 6, transport: "USB"),
+            .init(device: external, builtIn: false, isKeyboard: true, primaryUsagePage: 1, primaryUsage: 6, transport: "USB"),
+            // Virtual keyboard
+            .init(device: virtual, builtIn: false, isKeyboard: true, primaryUsagePage: 1, primaryUsage: 6, transport: "Virtual"),
+        ]
+        let classified = HIDMapping.classify(services)
+        if classified.builtIn != [builtIn] { return "built-in classified as \(classified.builtIn)" }
+        if classified.external != [external] { return "external classified as \(classified.external)" }
+
+        // Only a mouse plugged in: no external keyboard detected.
+        let mouseOnly = HIDMapping.classify(services.filter { $0.device != external })
+        if !mouseOnly.external.isEmpty { return "mouse-only still found external: \(mouseOnly.external)" }
+
+        // Disable entries cover standard keys + fn + Apple built-in F1–F12 media usages, never touch power.
+        let entries = HIDMapping.disableEntries
+        if Set(entries.map(\.src)).count != entries.count { return "duplicate src in disableEntries" }
+        if !entries.allSatisfy({ $0.dst == HIDMapping.noEvent }) { return "not all disableEntries map to noEvent" }
+        for id in ["a", "caps_lock", "fn", "spacebar", "left_command", "volume_increment"] {
+            guard let usage = KeyCatalog.key(id)?.usage else { return "missing \(id)" }
+            if !entries.contains(where: { $0.src == usage }) { return "disableEntries missing \(id)" }
+        }
+        for usage: UInt64 in [0xFF_0000_0005, 0xFF_0000_0004, 0xC_0000_0221, 0x1_0000_009B, 0xC_0000_00B4, 0xC_0000_00B3] {
+            if !entries.contains(where: { $0.src == usage }) { return "disableEntries missing 0x\(String(usage, radix: 16))" }
+        }
+        if entries.contains(where: { $0.src == 0xC_0000_0030 }) { return "disableEntries must not map power key" }
+        let parsed = HIDMapping.parseFnUsageMap("0x0007003a,0x00ff0005,0x0007003b,0x00ff0004,0x0007003f,0x0001009b,0x00070040,0x000c0030")
+        if parsed != [0xFF_0000_0005, 0xFF_0000_0004, 0x1_0000_009B] { return "parseFnUsageMap gave \(parsed)" }
+
+        // Plan round-trip: disabling built-in leaves external untouched, and turning off restores everything.
+        let start = HIDMapping.Snapshot(global: [], devices: [builtIn: [], external: []])
+        let desiredDisabled = HIDMapping.Desired(global: [rctrlToFn], devices: [builtIn: entries])
+        let applyPlan = HIDMapping.plan(current: start, previous: nil, desired: desiredDisabled)
+        let disabledState = simulate(start, applyPlan)
+        if disabledState.devices[external] != [rctrlToFn] { return "external keyboard mapping changed: \(String(describing: disabledState.devices[external]))" }
+        if !(disabledState.devices[builtIn] ?? []).contains(Entry(src: KeyCatalog.key("a")!.usage, dst: HIDMapping.noEvent)) {
+            return "built-in keyboard does not have disable entry for A"
+        }
+        let restorePlan = HIDMapping.plan(current: disabledState, previous: applyPlan.applied, desired: .init(global: [rctrlToFn]))
+        let restoredState = simulate(disabledState, restorePlan)
+        if !sameState(restoredState, .init(global: [rctrlToFn], devices: [builtIn: [rctrlToFn], external: [rctrlToFn]])) {
+            return "turning off disable did not restore built-in keyboard"
+        }
+        let stopPlan = HIDMapping.plan(current: disabledState, previous: applyPlan.applied, desired: .init())
+        if !sameState(simulate(disabledState, stopPlan), start) { return "stopping module did not restore clean state" }
         return nil
     }
 

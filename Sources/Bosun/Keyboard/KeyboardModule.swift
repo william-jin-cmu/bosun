@@ -22,9 +22,25 @@ final class KeyboardModule: ObservableObject, BosunModule {
     @Published private(set) var mappingError: String?
     @Published private(set) var karabinerRunning = false
     @Published private(set) var keyboards: [KeyboardDevice] = []
+    @Published private(set) var builtInKeyboards: [KeyboardDevice] = []
+    @Published private(set) var externalKeyboards: [KeyboardDevice] = []
+    @Published var disableBuiltInWhenExternalConnected: Bool {
+        didSet {
+            guard disableBuiltInWhenExternalConnected != oldValue else { return }
+            UserDefaults.standard.set(disableBuiltInWhenExternalConnected, forKey: Self.disableBuiltInKey)
+            if isRunning { sync() }
+        }
+    }
+
+    var builtInDisabled: Bool {
+        isRunning && disableBuiltInWhenExternalConnected && !builtInKeyboards.isEmpty && !externalKeyboards.isEmpty
+    }
 
     private static let appliedKey = "keyboard.appliedMapping"
+    private static let disableBuiltInKey = "keyboard.disableBuiltInWhenExternalConnected"
     private let tap = KeyTap()
+    private let watcher = KeyboardWatcher()
+    private var builtInFnUsages: [UInt64] = []
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var panelVisible = false
@@ -33,6 +49,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
     init() {
         let rules = KeyRuleSet.load().rules
         self.rules = rules
+        self.disableBuiltInWhenExternalConnected = UserDefaults.standard.bool(forKey: Self.disableBuiltInKey)
         program = KeyCompiler.compile(rules)
         tap.onLaunch = { bundleID in DispatchQueue.main.async { Self.open(bundleID) } }
         tap.onCapsLock = { CapsLock.pressed(long: $0) }
@@ -56,6 +73,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
                 MainActor.assumeIsolated { self?.tap.setFrontApp(bundleID) }
             },
         ]
+        watcher.start { [weak self] in self?.sync() }
         sync()
         refreshStatus()
         scheduleTimer()
@@ -66,6 +84,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
         isRunning = false
         timer?.invalidate()
         timer = nil
+        watcher.stop()
         observers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
         observers = []
         tap.stop()
@@ -76,6 +95,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
 
     func panelVisibilityChanged(_ visible: Bool) {
         panelVisible = visible
+        if visible { refreshClassifiedKeyboards() }
         guard isRunning else { return }
         if visible { tick() }
         scheduleTimer()
@@ -163,6 +183,14 @@ final class KeyboardModule: ObservableObject, BosunModule {
 
     func refreshKeyboards() {
         keyboards = HIDMapping.keyboards()
+        refreshClassifiedKeyboards()
+    }
+
+    private func refreshClassifiedKeyboards() {
+        let classified = HIDMapping.classifiedKeyboards()
+        if builtInKeyboards != classified.builtIn { builtInKeyboards = classified.builtIn }
+        if externalKeyboards != classified.external { externalKeyboards = classified.external }
+        builtInFnUsages = classified.builtInFnUsages
     }
 
     // MARK: Accessibility
@@ -209,6 +237,7 @@ final class KeyboardModule: ObservableObject, BosunModule {
 
     /// Brings the tap and the system mapping in line with the rules.
     private func sync(quiet: Bool = false) {
+        refreshClassifiedKeyboards()
         syncTap()
         applyMapping(quiet: quiet)
     }
@@ -253,7 +282,14 @@ final class KeyboardModule: ObservableObject, BosunModule {
         guard isRunning, recording != .physical else { return .init() }
         // Without the tap to swallow it, a carried Caps Lock would be a dead key.
         let carriers = tap.isRunning && recording == nil ? [] : program.carriers
-        return .init(global: program.global.filter { !carriers.contains($0) }, devices: program.devices)
+        var devices = program.devices
+        if disableBuiltInWhenExternalConnected && !externalKeyboards.isEmpty {
+            let disableEntries = HIDMapping.buildDisableEntries(extra: builtInFnUsages)
+            for device in builtInKeyboards {
+                devices[device] = disableEntries
+            }
+        }
+        return .init(global: program.global.filter { !carriers.contains($0) }, devices: devices)
     }
 
     /// Makes the system mapping "everyone else's entries plus ours", per
