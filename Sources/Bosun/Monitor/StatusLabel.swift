@@ -140,6 +140,8 @@ enum StatusRenderer {
             rep.size = size
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = context
+            // A bitmap context draws in pixels; scale so the pieces are laid out in points.
+            context.cgContext.scaleBy(x: scale, y: scale)
             var x: CGFloat = 0
             for piece in pieces {
                 let width = StatusLayout.width(piece)
@@ -264,6 +266,7 @@ enum StatusRenderer {
         guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
+        context.cgContext.scaleBy(x: scale, y: scale)
         (dark ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill()
         CGRect(origin: .zero, size: size).fill()
         let target = CGRect(x: padding, y: (size.height - image.size.height) / 2, width: image.size.width, height: image.size.height)
